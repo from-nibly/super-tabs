@@ -1,0 +1,69 @@
+// Tmux-style COLORED tab bar - demonstrates inline color syntax
+// Usage: zellij --layout tmux-colored.kdl
+//
+// This layout showcases the tmux-style inline color format strings:
+//   #[fg=color]     - Set foreground color
+//   #[fg=color,dim] - Set color with dim attribute
+//   #[fg=none]      - Reset to default foreground
+//   {=width:var}    - Truncate variable to width
+//
+// Available colors:
+//   accent/primary  - Theme primary color (palette 0)
+//   secondary       - Secondary accent (palette 1)
+//   tertiary        - Tertiary accent (palette 2)
+//   muted           - Muted/subtle (palette 3)
+//   dim             - Dimmed text (palette 4)
+//   error/red       - Error/warning color (palette 6)
+//   success/green   - Success color (palette 7)
+//   none/default    - Default foreground
+//
+// Available variables:
+//   {index} or {i}  - Tab number (1-indexed)
+//   {name} or {n}   - Tab name
+//   {title} or {t}  - Focused pane's terminal title
+//   {indicators}    - Combined indicators (fullscreen + sync + active)
+//   {fullscreen}    - "F" if fullscreen active
+//   {sync}          - "S" if sync mode active
+//   {active}        - Active indicator if current tab
+
+keybinds {
+    shared {
+        // Toggle selectability (for resizing the pane)
+        bind "Alt s" {
+            MessagePlugin "file:~/zellij-vertical-tabs/target/wasm32-wasip1/release/zellij-vertical-tabs.wasm" {
+                name "toggle_selectable"
+            }
+        }
+    }
+}
+
+layout {
+    pane split_direction="vertical" {
+        // Left sidebar with colorful tmux-style formatting
+        pane size=25 borderless=true {
+            plugin location="file:~/zellij-vertical-tabs/target/wasm32-wasip1/release/zellij-vertical-tabs.wasm" {
+                mode "vertical"
+
+                // Inactive tabs: muted index, default name
+                // Format: "1:my-shell"
+                format "#[fg=muted]{index}#[fg=none]:#[fg=secondary]{=18:title}"
+
+                // Active tabs: accent index, bright name, green indicators
+                // Format: "2:vim*" with colors
+                format_active "#[fg=accent]{index}#[fg=none]:#[fg=none]{=18:title}#[fg=success]{indicators}"
+
+                // Custom indicators
+                indicator_active "*"
+                indicator_fullscreen "#[fg=error]F"
+                indicator_sync "#[fg=tertiary]S"
+
+                max_name_length 18
+
+                // Dim border on the right
+                border "#[fg=dim]│"
+            }
+        }
+        // Main content pane
+        pane borderless=true focus=true
+    }
+}

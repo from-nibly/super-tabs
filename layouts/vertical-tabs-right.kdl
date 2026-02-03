@@ -1,0 +1,30 @@
+// Vertical tab bar on the RIGHT side
+// Usage: zellij --layout vertical-tabs-right.kdl
+
+keybinds {
+    shared {
+        // Toggle selectability (for resizing the pane)
+        bind "Alt s" {
+            MessagePlugin "file:~/zellij-vertical-tabs/target/wasm32-wasip1/release/zellij-vertical-tabs.wasm" {
+                name "toggle_selectable"
+            }
+        }
+    }
+}
+
+layout {
+    pane split_direction="vertical" {
+        pane
+        pane size=18 borderless=true {
+            plugin location="file:~/zellij-vertical-tabs/target/wasm32-wasip1/release/zellij-vertical-tabs.wasm" {
+                // Name-only style (no numbers)
+                format "#[fg=secondary]{name}"
+                format_active "#[fg=accent]● {name}"
+                max_name_length 15
+            }
+        }
+    }
+    pane size=1 borderless=true {
+        plugin location="zellij:status-bar"
+    }
+}

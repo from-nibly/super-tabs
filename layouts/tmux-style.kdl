@@ -1,0 +1,54 @@
+// Tmux-style tab bar - left sidebar
+// Usage: zellij --layout tmux-style.kdl
+//
+// Mimics tmux status line appearance:
+// - Format: index:name with * suffix for active
+// - Minimal, clean aesthetic
+// - Inline styles using #[fg=color] syntax (like tmux's #[fg=colour252])
+//
+// Color options:
+// - Named: accent, secondary, dim, muted, red, green, blue, etc.
+// - 256-color: 0-255 (e.g., fg=238 for dark gray)
+// - RGB hex: #RRGGBB or #RGB (e.g., fg=#444444)
+// - RGB function: rgb(r,g,b) (e.g., fg=rgb(68,68,68))
+// - Background: bg=color (same formats as fg)
+//
+// Available attributes: bold, dim
+
+keybinds {
+    shared {
+        // Toggle selectability (for resizing the pane)
+        bind "Alt s" {
+            MessagePlugin "file:~/zellij-vertical-tabs/target/wasm32-wasip1/release/zellij-vertical-tabs.wasm" {
+                name "toggle_selectable"
+            }
+        }
+    }
+}
+
+layout {
+    pane split_direction="vertical" {
+        // Left sidebar - tmux-style
+        pane size=20 borderless=true {
+            plugin location="file:~/zellij-vertical-tabs/target/wasm32-wasip1/release/zellij-vertical-tabs.wasm" {
+                mode "vertical"
+                // Tmux-style: index:title (pane title), active has * suffix
+                // For active tab highlighting options:
+                //   #[bg=236,fill] - fill entire row with background color 236
+                //   #[bg=236]      - background color on text only
+                //   (neither)      - no row highlight, just styled text
+                format "{index}:{title}"
+                format_active "#[bg=236,fill]{index}:{title}*"
+                // No fancy indicators - tmux uses simple * for current
+                indicator_active ""
+                indicator_fullscreen "F"
+                indicator_sync "S"
+                max_name_length 15
+                // Border with 256-color (238 = dark gray)
+                border "#[fg=238]│"
+            }
+        }
+        // Main content pane - borderless for clean tmux look
+        pane borderless=true focus=true
+    }
+}
