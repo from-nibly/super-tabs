@@ -434,7 +434,7 @@ struct StyleConfig {
     indicator_active: String,
     indicator_fullscreen: String,
     indicator_sync: String,
-    padding_right: usize,
+    padding_top: usize,
     border: String,
     max_name_length: usize,
     start_index: usize,
@@ -451,7 +451,7 @@ impl Default for StyleConfig {
             indicator_fullscreen: "Z".to_string(),
             indicator_sync: "S".to_string(),
             max_name_length: 20,
-            padding_right: 0,
+            padding_top: 0,
             border: String::new(),
             start_index: 1,
         }
@@ -519,9 +519,9 @@ impl ZellijPlugin for State {
                 self.style.max_name_length = n;
             }
         }
-        if let Some(v) = configuration.get("padding_right") {
+        if let Some(v) = configuration.get("padding_top") {
             if let Ok(n) = v.parse::<usize>() {
-                self.style.padding_right = n;
+                self.style.padding_top = n;
             }
         }
         if let Some(v) = configuration.get("border") {
@@ -771,7 +771,7 @@ impl State {
         let border = parse_styled_string(&self.style.border);
         let border_width = border.display_width();
 
-        let effective_cols = cols.saturating_sub(self.style.padding_right.max(border_width));
+        let effective_cols = cols.saturating_sub(border_width);
 
         // Truncate content if it exceeds available width to prevent wrapping
         let content = content.truncate(effective_cols);
@@ -839,13 +839,21 @@ impl State {
     }
 
     fn render_vertical(&mut self, rows: usize, cols: usize) {
+        let top_padding = self.style.padding_top;
+        let available_rows = rows.saturating_sub(top_padding);
+
         let tab_count = self.tabs.len();
         let active_index = self.active_tab_idx.saturating_sub(1);
 
         let (start_index, end_index, tabs_above, tabs_below) =
-            calculate_visible_range(tab_count, rows, active_index);
+            calculate_visible_range(tab_count, available_rows, active_index);
 
         let mut lines: Vec<String> = Vec::with_capacity(rows);
+
+        // Add top padding lines
+        for _ in 0..top_padding {
+            lines.push(self.build_empty_line(cols));
+        }
 
         // Render "above" overflow indicator
         if tabs_above > 0 {
