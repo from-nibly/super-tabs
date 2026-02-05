@@ -44,20 +44,6 @@ This plugin requires the following permissions:
 - **ReadApplicationState** - Required to receive tab information
 - **ChangeApplicationState** - Required to switch tabs when you click them
 
-### Option 1: Grant permissions automatically (recommended)
-
-Run the included script to pre-grant permissions:
-
-```bash
-# After installing the plugin to ~/.config/zellij/plugins/
-./scripts/grant-permissions.sh
-
-# Or specify a custom plugin path
-./scripts/grant-permissions.sh "file:/path/to/zellij-vertical-tabs.wasm"
-```
-
-### Option 2: Grant interactively
-
 On first run, zellij will prompt you to grant permissions. Focus the plugin pane and press `y` to grant.
 
 ## Installation
@@ -83,14 +69,11 @@ On first run, zellij will prompt you to grant permissions. Focus the plugin pane
 
 ### Installing the Plugin
 
-Copy the `.wasm` file to your zellij plugin directory and grant permissions:
+Copy the `.wasm` file to your zellij plugin directory:
 
 ```bash
 mkdir -p ~/.config/zellij/plugins
 cp target/wasm32-wasip1/release/zellij-vertical-tabs.wasm ~/.config/zellij/plugins/
-
-# Grant permissions (avoids interactive prompt)
-./scripts/grant-permissions.sh
 ```
 
 ## Usage
@@ -108,6 +91,9 @@ zellij --layout layouts/vertical-tabs-right.kdl
 
 # Tmux-style (minimal, with pane titles)
 zellij --layout layouts/tmux-style.kdl
+
+# Tmux-style with colors (demonstrates inline color syntax)
+zellij --layout layouts/tmux-colored.kdl
 ```
 
 ### Custom Layouts
@@ -198,6 +184,13 @@ plugin location="file:~/.config/zellij/plugins/zellij-vertical-tabs.wasm" {
 
     // Start tab numbering from (default: 1)
     start_index 1
+
+    // Empty rows above the tab list (default: 0)
+    padding_top 0
+
+    // Overflow indicator formats (when tabs don't fit)
+    overflow_above "  ^ +{count}"
+    overflow_below "  v +{count}"
 }
 ```
 
