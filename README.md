@@ -2,19 +2,11 @@
 
 A zellij plugin that displays tabs vertically as rows on the left or right side of the screen, instead of the default horizontal tab bar at the top.
 
+![Vertical Tab Bar Screenshot](screenshot.png)
+
 ## Why Vertical Tabs?
 
 Horizontal tab bars become hard to read when you have many tabs - names get truncated and it's difficult to see all your tabs at a glance. A vertical tab bar shows each tab on its own row, making it easy to see all tab names and quickly navigate between them.
-
-```
-┌──────────────┬──────────────────────────────┐
-│ 1:shell*     │                              │
-│ 2:server     │  Your terminal content here  │
-│ 3:logs       │                              │
-│ 4:editor     │                              │
-│ 5:htop       │                              │
-└──────────────┴──────────────────────────────┘
-```
 
 ## Features
 
