@@ -44,21 +44,11 @@ jobs:
             exit 1
           fi
 
-      - name: Prepare artifact
-        run: |
-          mkdir -p artifacts
-          cp "target/wasm32-wasip1/release/zellij-vertical-tabs.wasm" "artifacts/"
-          cd artifacts
-          tar -czf zellij-vertical-tabs-wasm32-wasip1.tar.gz zellij-vertical-tabs.wasm
-          rm zellij-vertical-tabs.wasm
-          echo "Contents of artifacts directory:"
-          ls -la
-
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
           name: zellij-vertical-tabs-wasm32-wasip1
-          path: artifacts/*.tar.gz
+          path: target/wasm32-wasip1/release/zellij-vertical-tabs.wasm
           if-no-files-found: error
 
   release:
@@ -75,12 +65,12 @@ jobs:
       - name: List artifacts
         run: |
           echo "Downloaded artifacts:"
-          find artifacts -type f -name "*.tar.gz" | sort
+          find artifacts -type f -name "*.wasm" | sort
 
       - name: Flatten artifacts
         run: |
           mkdir -p release-artifacts
-          find artifacts -type f -name "*.tar.gz" -exec cp {} release-artifacts/ \;
+          find artifacts -type f -name "*.wasm" -exec cp {} release-artifacts/ \;
           ls -la release-artifacts/
 
       - name: Create Release
