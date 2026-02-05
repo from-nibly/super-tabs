@@ -75,11 +75,11 @@ fn parse_color_spec(name: &str) -> ColorSpec {
         "none" | "default" | "reset" => ColorSpec::Default,
 
         // Theme-like semantic colors (mapped to reasonable 256-color values)
-        "accent" | "primary" => ColorSpec::EightBit(39),    // Bright blue
-        "secondary" => ColorSpec::EightBit(75),              // Light blue
-        "tertiary" => ColorSpec::EightBit(141),              // Purple
-        "muted" | "quaternary" => ColorSpec::EightBit(245),  // Light gray
-        "dim" | "dimmed" => ColorSpec::EightBit(240),        // Dark gray
+        "accent" | "primary" => ColorSpec::EightBit(39), // Bright blue
+        "secondary" => ColorSpec::EightBit(75),          // Light blue
+        "tertiary" => ColorSpec::EightBit(141),          // Purple
+        "muted" | "quaternary" => ColorSpec::EightBit(245), // Light gray
+        "dim" | "dimmed" => ColorSpec::EightBit(240),    // Dark gray
 
         // Standard colors
         "black" => ColorSpec::EightBit(0),
@@ -636,9 +636,7 @@ impl State {
             for pane in panes {
                 if pane.is_focused && !pane.is_plugin {
                     let title = &pane.title;
-                    if title.starts_with("Pane #")
-                        || title.starts_with("Tab #")
-                        || title.is_empty()
+                    if title.starts_with("Pane #") || title.starts_with("Tab #") || title.is_empty()
                     {
                         return None;
                     }
@@ -837,7 +835,8 @@ impl State {
 
         // Render "above" overflow indicator
         if tabs_above > 0 {
-            let indicator_text = self.expand_overflow_format(&self.style.overflow_above, tabs_above);
+            let indicator_text =
+                self.expand_overflow_format(&self.style.overflow_above, tabs_above);
             let styled = parse_styled_string(&indicator_text);
             lines.push(self.build_line(&styled, cols, false));
         }
@@ -859,7 +858,8 @@ impl State {
 
         // Render "below" overflow indicator
         if tabs_below > 0 {
-            let indicator_text = self.expand_overflow_format(&self.style.overflow_below, tabs_below);
+            let indicator_text =
+                self.expand_overflow_format(&self.style.overflow_below, tabs_below);
             let styled = parse_styled_string(&indicator_text);
             lines.push(self.build_line(&styled, cols, false));
         }
