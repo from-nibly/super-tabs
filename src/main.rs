@@ -6,9 +6,10 @@ use zellij_tile::prelude::*;
 // ========== COLOR SYSTEM ==========
 
 /// Color specification supporting default, 256-color, and RGB
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
 enum ColorSpec {
     /// Use terminal default color
+    #[default]
     Default,
     /// 256-color palette index (0-255)
     EightBit(u8),
@@ -16,15 +17,9 @@ enum ColorSpec {
     Rgb(u8, u8, u8),
 }
 
-impl Default for ColorSpec {
-    fn default() -> Self {
-        ColorSpec::Default
-    }
-}
-
 impl ColorSpec {
     /// Generate ANSI escape code for foreground color
-    fn to_ansi_fg(&self) -> String {
+    fn to_ansi_fg(self) -> String {
         match self {
             ColorSpec::Default => String::new(),
             ColorSpec::EightBit(n) => format!("\x1b[38;5;{}m", n),
@@ -33,7 +28,7 @@ impl ColorSpec {
     }
 
     /// Generate ANSI escape code for background color
-    fn to_ansi_bg(&self) -> String {
+    fn to_ansi_bg(self) -> String {
         match self {
             ColorSpec::Default => String::new(),
             ColorSpec::EightBit(n) => format!("\x1b[48;5;{}m", n),
@@ -41,7 +36,7 @@ impl ColorSpec {
         }
     }
 
-    fn is_default(&self) -> bool {
+    fn is_default(self) -> bool {
         matches!(self, ColorSpec::Default)
     }
 }
@@ -56,17 +51,17 @@ fn parse_color_spec(name: &str) -> ColorSpec {
     let name = name.trim();
 
     // Check for RGB hex: #RGB or #RRGGBB
-    if let Some(hex) = name.strip_prefix('#') {
-        if let Some((r, g, b)) = parse_hex_color(hex) {
-            return ColorSpec::Rgb(r, g, b);
-        }
+    if let Some(hex) = name.strip_prefix('#')
+        && let Some((r, g, b)) = parse_hex_color(hex)
+    {
+        return ColorSpec::Rgb(r, g, b);
     }
 
     // Check for rgb(r,g,b) syntax
-    if let Some(inner) = name.strip_prefix("rgb(").and_then(|s| s.strip_suffix(')')) {
-        if let Some((r, g, b)) = parse_rgb_func(inner) {
-            return ColorSpec::Rgb(r, g, b);
-        }
+    if let Some(inner) = name.strip_prefix("rgb(").and_then(|s| s.strip_suffix(')'))
+        && let Some((r, g, b)) = parse_rgb_func(inner)
+    {
+        return ColorSpec::Rgb(r, g, b);
     }
 
     // Check for numeric 256-color
@@ -379,16 +374,16 @@ fn parse_variable(chars: &mut std::iter::Peekable<std::str::Chars>) -> FormatTok
     }
 
     // Check for width specifier: =12:varname
-    if let Some(rest) = content.strip_prefix('=') {
-        if let Some(colon_pos) = rest.find(':') {
-            let width_str = &rest[..colon_pos];
-            let var_name = &rest[colon_pos + 1..];
-            if let Ok(width) = width_str.parse::<usize>() {
-                return FormatToken::Variable {
-                    name: var_name.to_string(),
-                    width: Some(width),
-                };
-            }
+    if let Some(rest) = content.strip_prefix('=')
+        && let Some(colon_pos) = rest.find(':')
+    {
+        let width_str = &rest[..colon_pos];
+        let var_name = &rest[colon_pos + 1..];
+        if let Ok(width) = width_str.parse::<usize>() {
+            return FormatToken::Variable {
+                name: var_name.to_string(),
+                width: Some(width),
+            };
         }
     }
 
@@ -460,6 +455,7 @@ impl Default for StyleConfig {
 
 // ========== PLUGIN STATE ==========
 
+#[derive(Default)]
 struct State {
     tabs: Vec<TabInfo>,
     active_tab_idx: usize,
@@ -470,22 +466,6 @@ struct State {
     permissions_granted: bool,
     is_selectable: bool,
     pending_events: Vec<Event>,
-}
-
-impl Default for State {
-    fn default() -> Self {
-        Self {
-            tabs: Vec::new(),
-            active_tab_idx: 0,
-            mode_info: ModeInfo::default(),
-            pane_manifest: PaneManifest::default(),
-            style: StyleConfig::default(),
-            last_rows: 0,
-            permissions_granted: false,
-            is_selectable: false,
-            pending_events: Vec::new(),
-        }
-    }
 }
 
 register_plugin!(State);
@@ -514,25 +494,25 @@ impl ZellijPlugin for State {
         if let Some(v) = configuration.get("indicator_sync") {
             self.style.indicator_sync = v.clone();
         }
-        if let Some(v) = configuration.get("max_name_length") {
-            if let Ok(n) = v.parse::<usize>() {
-                self.style.max_name_length = n;
-            }
+        if let Some(v) = configuration.get("max_name_length")
+            && let Ok(n) = v.parse::<usize>()
+        {
+            self.style.max_name_length = n;
         }
-        if let Some(v) = configuration.get("padding_top") {
-            if let Ok(n) = v.parse::<usize>() {
-                self.style.padding_top = n;
-            }
+        if let Some(v) = configuration.get("padding_top")
+            && let Ok(n) = v.parse::<usize>()
+        {
+            self.style.padding_top = n;
         }
         if let Some(v) = configuration.get("border") {
             self.style.border = v.clone();
         } else if let Some(v) = configuration.get("border_char") {
             self.style.border = v.clone();
         }
-        if let Some(v) = configuration.get("start_index") {
-            if let Ok(n) = v.parse::<usize>() {
-                self.style.start_index = n;
-            }
+        if let Some(v) = configuration.get("start_index")
+            && let Ok(n) = v.parse::<usize>()
+        {
+            self.style.start_index = n;
         }
 
         request_permission(&[
