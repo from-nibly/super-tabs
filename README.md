@@ -40,6 +40,16 @@ On first run, zellij will prompt you to grant permissions. Focus the plugin pane
 
 ## Installation
 
+### Download from Releases
+
+1. Download `zellij-vertical-tabs.wasm` from the [latest release](https://github.com/cfal/zellij-vertical-tabs/releases/latest)
+
+2. Copy it to your zellij plugins directory:
+   ```bash
+   mkdir -p ~/.config/zellij/plugins
+   cp zellij-vertical-tabs.wasm ~/.config/zellij/plugins/
+   ```
+
 ### Building from Source
 
 1. **Install the WebAssembly target** (one-time setup):
@@ -49,24 +59,16 @@ On first run, zellij will prompt you to grant permissions. Focus the plugin pane
 
 2. **Clone and build**:
    ```bash
-   git clone <repository-url>
+   git clone https://github.com/cfal/zellij-vertical-tabs.git
    cd zellij-vertical-tabs
    cargo build --release
    ```
 
-3. **Locate the built plugin**:
+3. **Copy the plugin** to your zellij plugins directory:
+   ```bash
+   mkdir -p ~/.config/zellij/plugins
+   cp target/wasm32-wasip1/release/zellij-vertical-tabs.wasm ~/.config/zellij/plugins/
    ```
-   target/wasm32-wasip1/release/zellij-vertical-tabs.wasm
-   ```
-
-### Installing the Plugin
-
-Copy the `.wasm` file to your zellij plugin directory:
-
-```bash
-mkdir -p ~/.config/zellij/plugins
-cp target/wasm32-wasip1/release/zellij-vertical-tabs.wasm ~/.config/zellij/plugins/
-```
 
 ## Usage
 
