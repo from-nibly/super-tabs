@@ -1,6 +1,6 @@
 # Vertical Tab Bar for Zellij
 
-A zellij plugin that displays tabs vertically as rows on the left or right side of the screen, instead of the default horizontal tab bar at the top.
+A zellij plugin that displays tabs vertically on the left or right side of the screen.
 
 ![Vertical Tab Bar Screenshot](screenshot.png)
 
@@ -37,6 +37,15 @@ This plugin requires the following permissions:
 - **ChangeApplicationState** - Required to switch tabs when you click them
 
 On first run, zellij will prompt you to grant permissions. Focus the plugin pane and press `y` to grant.
+
+If the permissions popup doesn't seem responsive, you can write to the permissions file directly. On Linux, edit `~/.cache/zellij/permissions.kdl` and add:
+
+```kdl
+"/absolute/path/to/zellij-vertical-tabs.wasm" {
+    ReadApplicationState
+    ChangeApplicationState
+}
+```
 
 ## Installation
 
@@ -78,16 +87,16 @@ Use one of the included layout files:
 
 ```bash
 # Tab bar on the LEFT side
-zellij --layout layouts/vertical-tabs-left.kdl
+zellij --layout examples/vertical-tabs-left.kdl
 
 # Tab bar on the RIGHT side
-zellij --layout layouts/vertical-tabs-right.kdl
+zellij --layout examples/vertical-tabs-right.kdl
 
 # Tmux-style (minimal, with pane titles)
-zellij --layout layouts/tmux-style.kdl
+zellij --layout examples/tmux-style.kdl
 
 # Tmux-style with colors (demonstrates inline color syntax)
-zellij --layout layouts/tmux-colored.kdl
+zellij --layout examples/tmux-colored.kdl
 ```
 
 ### Custom Layouts
