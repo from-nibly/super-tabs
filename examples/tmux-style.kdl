@@ -31,7 +31,6 @@ layout {
         // Left sidebar - tmux-style
         pane size=20 borderless=true {
             plugin location="file:~/zellij-vertical-tabs/target/wasm32-wasip1/release/zellij-vertical-tabs.wasm" {
-                mode "vertical"
                 // Tmux-style: index:title (pane title), active has * suffix
                 // For active tab highlighting options:
                 //   #[bg=236,fill] - fill entire row with background color 236
