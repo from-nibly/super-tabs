@@ -1,5 +1,7 @@
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
+const TRUNCATION_MARKER: &str = "…";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ColorSpec {
     #[default]
@@ -128,20 +130,20 @@ impl StyledText {
 
     pub fn to_ansi(&self) -> String {
         let mut result = String::new();
+        let mut current_style = InlineStyle::default();
 
         for segment in &self.segments {
-            if segment.style.has_any_style() {
-                result.push_str("\x1b[0m");
+            if segment.style != current_style {
+                if current_style.has_any_style() {
+                    result.push_str("\x1b[0m");
+                }
                 result.push_str(&segment.style.to_ansi());
+                current_style = segment.style.clone();
             }
             result.push_str(&segment.text);
         }
 
-        if self
-            .segments
-            .iter()
-            .any(|segment| segment.style.has_any_style())
-        {
+        if current_style.has_any_style() {
             result.push_str("\x1b[0m");
         }
 
@@ -163,12 +165,14 @@ impl StyledText {
         if max_width == 0 {
             return Self::new();
         }
-        if max_width <= 3 {
-            return Self::plain(".".repeat(max_width));
+
+        let marker_width = TRUNCATION_MARKER.width();
+        if max_width <= marker_width {
+            return Self::plain(TRUNCATION_MARKER);
         }
 
-        let mut truncated = self.take_prefix(max_width - 3);
-        truncated.push_plain("...");
+        let mut truncated = self.take_prefix(max_width - marker_width);
+        truncated.push_plain(TRUNCATION_MARKER);
         truncated
     }
 
@@ -179,12 +183,14 @@ impl StyledText {
         if max_width == 0 {
             return Self::new();
         }
-        if max_width <= 3 {
-            return Self::plain(".".repeat(max_width));
+
+        let marker_width = TRUNCATION_MARKER.width();
+        if max_width <= marker_width {
+            return Self::plain(TRUNCATION_MARKER);
         }
 
-        let mut truncated = Self::plain("...");
-        truncated.extend(self.take_suffix(max_width - 3));
+        let mut truncated = Self::plain(TRUNCATION_MARKER);
+        truncated.extend(self.take_suffix(max_width - marker_width));
         truncated
     }
 
@@ -460,14 +466,27 @@ mod tests {
     }
 
     #[test]
+    fn ansi_output_resets_before_default_text() {
+        let styled = parse_styled_string("#[fg=yellow]IDLE #[default]rest");
+        assert_eq!(styled.to_ansi(), "\x1b[38;5;226mIDLE \x1b[0mrest");
+    }
+
+    #[test]
     fn truncate_end_keeps_prefix() {
         let styled = StyledText::plain("abcdefgh");
-        assert_eq!(styled.truncate_end(5).plain_text(), "ab...");
+        assert_eq!(styled.truncate_end(5).plain_text(), "abcd…");
     }
 
     #[test]
     fn truncate_start_keeps_suffix() {
         let styled = StyledText::plain("abcdefgh");
-        assert_eq!(styled.truncate_start(5).plain_text(), "...gh");
+        assert_eq!(styled.truncate_start(5).plain_text(), "…efgh");
+    }
+
+    #[test]
+    fn truncation_uses_single_marker_for_tiny_widths() {
+        let styled = StyledText::plain("abcdefgh");
+        assert_eq!(styled.truncate_end(1).plain_text(), "…");
+        assert_eq!(styled.truncate_start(1).plain_text(), "…");
     }
 }
