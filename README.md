@@ -4,7 +4,7 @@ Schema-driven vertical tabs for Zellij with aligned multi-column metadata, pane-
 
 ## Features
 
-- Static column schema with widths aligned across all tabs in the session
+- Static column schema with widths aligned across all tabs in the session, including exact fixed-width columns
 - Multi-color cell content using tmux-style `#[...]` inline styles
 - `super-tabs set ...` CLI updates routed by pane id
 - Incremental per-column width tracking instead of full rescans on each update
@@ -104,7 +104,7 @@ layout {
                 columns "branch,status,title"
 
                 column_branch "resize=trunc:end:hard:12;style=#[fg=blue]"
-                column_status "resize=trunc:end:hard:10;style=#[fg=yellow]"
+                column_status "resize=trunc:end:fixed:10;style=#[fg=yellow]"
                 column_title  "resize=resize;style=#[fg=muted]"
 
                 border "#[fg=dim]│"
@@ -125,7 +125,11 @@ layout {
 - `resize=trunc:end:flow:N`
 - `resize=trunc:start:hard:N`
 - `resize=trunc:end:hard:N`
+- `resize=trunc:start:fixed:N`
+- `resize=trunc:end:fixed:N`
 - `style=#[...]`
+
+`hard` caps a column at `N` cells but still lets it shrink when every value is shorter. `fixed` always reserves exactly `N` cells for that column and truncates using the configured side when content is longer.
 
 ### Indicator Configuration
 

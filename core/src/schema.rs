@@ -116,7 +116,7 @@ mod tests {
             ),
             (
                 "column_status".to_string(),
-                "resize=trunc:end:hard:10;style=#[fg=yellow]".to_string(),
+                "resize=trunc:end:fixed:10;style=#[fg=yellow]".to_string(),
             ),
         ]);
 
@@ -127,7 +127,7 @@ mod tests {
             schema.columns()[1].resize_spec,
             ResizeSpec::Truncate {
                 side: TruncationSide::End,
-                mode: ResizeMode::Hard(10),
+                mode: ResizeMode::Fixed(10),
             }
         );
     }

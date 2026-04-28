@@ -13,6 +13,7 @@ pub enum TruncationSide {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ResizeMode {
     Hard(usize),
+    Fixed(usize),
     Flow(usize),
 }
 
@@ -54,6 +55,7 @@ impl ResizeSpec {
 
         let mode = match mode {
             "hard" => ResizeMode::Hard(amount),
+            "fixed" => ResizeMode::Fixed(amount),
             "flow" => ResizeMode::Flow(amount.max(1)),
             _ => return Err(format!("invalid resize mode `{mode}`")),
         };
@@ -131,6 +133,13 @@ pub fn solve_column_widths(
                 ..
             } => {
                 widths[index] = min(*natural_width, limit);
+                fixed_total += widths[index];
+            }
+            ResizeSpec::Truncate {
+                mode: ResizeMode::Fixed(limit),
+                ..
+            } => {
+                widths[index] = limit;
                 fixed_total += widths[index];
             }
             ResizeSpec::Truncate {
@@ -245,6 +254,13 @@ mod tests {
                 mode: ResizeMode::Hard(10),
             }
         );
+        assert_eq!(
+            ResizeSpec::parse("trunc:end:fixed:10").unwrap(),
+            ResizeSpec::Truncate {
+                side: TruncationSide::End,
+                mode: ResizeMode::Fixed(10),
+            }
+        );
     }
 
     #[test]
@@ -257,6 +273,18 @@ mod tests {
             },
         )];
         assert_eq!(solve_column_widths(&columns, &[10], 20, 1), vec![4]);
+    }
+
+    #[test]
+    fn fixed_width_reserves_exact_space() {
+        let columns = vec![column(
+            "status",
+            ResizeSpec::Truncate {
+                side: TruncationSide::End,
+                mode: ResizeMode::Fixed(10),
+            },
+        )];
+        assert_eq!(solve_column_widths(&columns, &[3], 20, 1), vec![10]);
     }
 
     #[test]
