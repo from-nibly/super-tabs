@@ -2324,6 +2324,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "super-tabs"
+version = "0.1.0"
+dependencies = [
+ "super-tabs-core",
+ "zellij-tile",
+]
+
+[[package]]
+name = "super-tabs-cli"
+version = "0.1.0"
+dependencies = [
+ "super-tabs-core",
+]
+
+[[package]]
+name = "super-tabs-core"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "unicode-width 0.2.2",
+]
+
+[[package]]
 name = "supports-color"
 version = "2.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3342,14 +3366,6 @@ dependencies = [
  "unicode-width 0.1.14",
  "url",
  "uuid",
-]
-
-[[package]]
-name = "zellij-vertical-tabs"
-version = "0.1.0"
-dependencies = [
- "unicode-width 0.2.2",
- "zellij-tile",
 ]
 
 [[package]]

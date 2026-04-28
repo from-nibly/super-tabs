@@ -1,0 +1,33 @@
+// Super Tabs on the LEFT side
+// Usage: zellij --layout examples/super-tabs-left.kdl
+
+keybinds {
+    shared {
+        bind "Alt s" {
+            MessagePlugin "file:/Users/jordan/.config/zellij/plugins/super-tabs.wasm" {
+                name "toggle_selectable"
+            }
+        }
+    }
+}
+
+layout {
+    pane split_direction="vertical" {
+        pane size=50 borderless=true {
+            plugin location="file:/Users/jordan/.config/zellij/plugins/super-tabs.wasm" {
+                columns "branch,status,title"
+                column_branch "resize=trunc:end:hard:12;style=#[fg=accent]"
+                column_status "resize=trunc:end:hard:10;style=#[fg=yellow]"
+                column_title "resize=trunc:end:flow:3;style=#[fg=muted]"
+                indicator_active "●"
+                indicator_fullscreen "□"
+                indicator_sync "⇄"
+                border "#[fg=dim]│"
+            }
+        }
+        pane
+    }
+    pane size=1 borderless=true {
+        plugin location="zellij:status-bar"
+    }
+}

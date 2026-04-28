@@ -1,5 +1,5 @@
-// Tmux-inspired Super Tabs sidebar
-// Usage: zellij --layout tmux-style.kdl
+// Super Tabs on the RIGHT side
+// Usage: zellij --layout examples/super-tabs-right.kdl
 
 keybinds {
     shared {
@@ -13,18 +13,18 @@ keybinds {
 
 layout {
     pane split_direction="vertical" {
+        pane
         pane size=30 borderless=true {
             plugin location="file:/Users/jordan/.config/zellij/plugins/super-tabs.wasm" {
-                columns "session,branch,title"
-                column_session "resize=trunc:end:hard:6;style=#[fg=238]"
-                column_branch "resize=trunc:end:hard:12;style=#[fg=secondary]"
+                columns ""
+                column_service "resize=trunc:end:hard:12;style=#[fg=secondary]"
+                column_owner "resize=trunc:end:hard:10;style=#[fg=tertiary]"
                 column_title "resize=trunc:end:flow:4;style=#[fg=none]"
-                indicator_active "*"
-                indicator_fullscreen "F"
-                indicator_sync "S"
-                border "#[fg=238]│"
+                border "#[fg=dim]│"
             }
         }
-        pane borderless=true focus=true
+    }
+    pane size=1 borderless=true {
+        plugin location="zellij:status-bar"
     }
 }

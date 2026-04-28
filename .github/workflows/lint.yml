@@ -54,5 +54,5 @@ jobs:
         path: target
         key: ${{ runner.os }}-cargo-build-target-wasm32-wasip1-${{ hashFiles('**/Cargo.lock') }}
 
-    - name: Run clippy
-      run: cargo clippy --target wasm32-wasip1 -- -D warnings
+      - name: Run clippy
+        run: cargo clippy -p super-tabs --target wasm32-wasip1 -- -D warnings

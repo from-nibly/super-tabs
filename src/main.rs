@@ -1,429 +1,15 @@
 use std::cmp::{max, min};
-use std::collections::BTreeMap;
-use unicode_width::UnicodeWidthStr;
+use std::collections::{BTreeMap, BTreeSet};
+
+use super_tabs_core::{
+    CellState, PIPE_NAME, Schema, StyledText, UpdatePayload, WidthIndex, apply_default_style,
+    clip_right_edge, decode_tab_name, encode_tab_name, fit_cell_to_width, parse_styled_string,
+    solve_column_widths,
+};
 use zellij_tile::prelude::*;
 
-// ========== COLOR SYSTEM ==========
-
-/// Color specification supporting default, 256-color, and RGB
-#[derive(Debug, Clone, Copy, PartialEq, Default)]
-enum ColorSpec {
-    /// Use terminal default color
-    #[default]
-    Default,
-    /// 256-color palette index (0-255)
-    EightBit(u8),
-    /// True color RGB
-    Rgb(u8, u8, u8),
-}
-
-impl ColorSpec {
-    /// Generate ANSI escape code for foreground color
-    fn to_ansi_fg(self) -> String {
-        match self {
-            ColorSpec::Default => String::new(),
-            ColorSpec::EightBit(n) => format!("\x1b[38;5;{}m", n),
-            ColorSpec::Rgb(r, g, b) => format!("\x1b[38;2;{};{};{}m", r, g, b),
-        }
-    }
-
-    /// Generate ANSI escape code for background color
-    fn to_ansi_bg(self) -> String {
-        match self {
-            ColorSpec::Default => String::new(),
-            ColorSpec::EightBit(n) => format!("\x1b[48;5;{}m", n),
-            ColorSpec::Rgb(r, g, b) => format!("\x1b[48;2;{};{};{}m", r, g, b),
-        }
-    }
-
-    fn is_default(self) -> bool {
-        matches!(self, ColorSpec::Default)
-    }
-}
-
-/// Parse a color value from string
-/// Supports:
-/// - Named colors: "accent", "dim", "red", etc.
-/// - 256-color: "238"
-/// - Hex RGB: "#444444" or "#444"
-/// - RGB function: "rgb(68,68,68)"
-fn parse_color_spec(name: &str) -> ColorSpec {
-    let name = name.trim();
-
-    // Check for RGB hex: #RGB or #RRGGBB
-    if let Some(hex) = name.strip_prefix('#')
-        && let Some((r, g, b)) = parse_hex_color(hex)
-    {
-        return ColorSpec::Rgb(r, g, b);
-    }
-
-    // Check for rgb(r,g,b) syntax
-    if let Some(inner) = name.strip_prefix("rgb(").and_then(|s| s.strip_suffix(')'))
-        && let Some((r, g, b)) = parse_rgb_func(inner)
-    {
-        return ColorSpec::Rgb(r, g, b);
-    }
-
-    // Check for numeric 256-color
-    if let Ok(n) = name.parse::<u8>() {
-        return ColorSpec::EightBit(n);
-    }
-
-    // Named colors mapped to 256-color approximations
-    match name.to_lowercase().as_str() {
-        // Default/reset
-        "none" | "default" | "reset" => ColorSpec::Default,
-
-        // Theme-like semantic colors (mapped to reasonable 256-color values)
-        "accent" | "primary" => ColorSpec::EightBit(39), // Bright blue
-        "secondary" => ColorSpec::EightBit(75),          // Light blue
-        "tertiary" => ColorSpec::EightBit(141),          // Purple
-        "muted" | "quaternary" => ColorSpec::EightBit(245), // Light gray
-        "dim" | "dimmed" => ColorSpec::EightBit(240),    // Dark gray
-
-        // Standard colors
-        "black" => ColorSpec::EightBit(0),
-        "red" | "error" | "warning" => ColorSpec::EightBit(196),
-        "green" | "success" | "ok" => ColorSpec::EightBit(82),
-        "yellow" => ColorSpec::EightBit(226),
-        "blue" => ColorSpec::EightBit(33),
-        "magenta" => ColorSpec::EightBit(201),
-        "cyan" => ColorSpec::EightBit(51),
-        "white" => ColorSpec::EightBit(15),
-        "orange" => ColorSpec::EightBit(208),
-        "gray" | "grey" => ColorSpec::EightBit(244),
-        "pink" => ColorSpec::EightBit(213),
-        "purple" => ColorSpec::EightBit(135),
-
-        // Unknown - use default
-        _ => ColorSpec::Default,
-    }
-}
-
-/// Parse hex color: "444444" or "444" -> (r, g, b)
-fn parse_hex_color(hex: &str) -> Option<(u8, u8, u8)> {
-    match hex.len() {
-        3 => {
-            // #RGB -> expand to #RRGGBB
-            let r = u8::from_str_radix(&hex[0..1], 16).ok()? * 17;
-            let g = u8::from_str_radix(&hex[1..2], 16).ok()? * 17;
-            let b = u8::from_str_radix(&hex[2..3], 16).ok()? * 17;
-            Some((r, g, b))
-        }
-        6 => {
-            let r = u8::from_str_radix(&hex[0..2], 16).ok()?;
-            let g = u8::from_str_radix(&hex[2..4], 16).ok()?;
-            let b = u8::from_str_radix(&hex[4..6], 16).ok()?;
-            Some((r, g, b))
-        }
-        _ => None,
-    }
-}
-
-/// Parse "r,g,b" -> (r, g, b)
-fn parse_rgb_func(inner: &str) -> Option<(u8, u8, u8)> {
-    let parts: Vec<&str> = inner.split(',').collect();
-    if parts.len() != 3 {
-        return None;
-    }
-    let r = parts[0].trim().parse::<u8>().ok()?;
-    let g = parts[1].trim().parse::<u8>().ok()?;
-    let b = parts[2].trim().parse::<u8>().ok()?;
-    Some((r, g, b))
-}
-
-// ========== STYLE SYSTEM ==========
-
-/// Inline style from #[...] directive
-#[derive(Debug, Clone, Default)]
-struct InlineStyle {
-    fg: ColorSpec,
-    bg: ColorSpec,
-    bold: bool,
-    dim: bool,
-    fill: bool,
-}
-
-impl InlineStyle {
-    /// Generate ANSI escape codes for this style (without reverse - that's handled at line level)
-    fn to_ansi(&self) -> String {
-        let mut result = String::new();
-
-        // Attributes
-        if self.bold {
-            result.push_str("\x1b[1m");
-        }
-        if self.dim {
-            result.push_str("\x1b[2m");
-        }
-
-        // Colors
-        result.push_str(&self.fg.to_ansi_fg());
-        result.push_str(&self.bg.to_ansi_bg());
-
-        result
-    }
-
-    fn has_any_style(&self) -> bool {
-        !self.fg.is_default() || !self.bg.is_default() || self.bold || self.dim || self.fill
-    }
-}
-
-/// A segment of text with styling
-#[derive(Debug, Clone)]
-struct StyledSegment {
-    text: String,
-    style: InlineStyle,
-}
-
-impl StyledSegment {
-    fn display_width(&self) -> usize {
-        self.text.width()
-    }
-}
-
-/// Collection of styled segments forming a complete styled string
-#[derive(Debug, Clone, Default)]
-struct StyledText {
-    segments: Vec<StyledSegment>,
-}
-
-impl StyledText {
-    fn new() -> Self {
-        Self { segments: vec![] }
-    }
-
-    fn push(&mut self, text: String, style: InlineStyle) {
-        if !text.is_empty() {
-            self.segments.push(StyledSegment { text, style });
-        }
-    }
-
-    fn display_width(&self) -> usize {
-        self.segments.iter().map(|s| s.display_width()).sum()
-    }
-
-    /// Render to ANSI-coded string
-    fn to_ansi(&self) -> String {
-        let mut result = String::new();
-
-        for segment in &self.segments {
-            if segment.style.has_any_style() {
-                result.push_str("\x1b[0m"); // Reset before applying new style
-                result.push_str(&segment.style.to_ansi());
-            }
-            result.push_str(&segment.text);
-        }
-
-        // Reset at end
-        if self.segments.iter().any(|s| s.style.has_any_style()) {
-            result.push_str("\x1b[0m");
-        }
-
-        result
-    }
-
-    /// Truncate to fit within max_width display columns
-    fn truncate(&self, max_width: usize) -> StyledText {
-        if self.display_width() <= max_width {
-            return self.clone();
-        }
-
-        let mut result = StyledText::new();
-        let mut remaining = max_width;
-
-        for segment in &self.segments {
-            if remaining == 0 {
-                break;
-            }
-
-            let seg_width = segment.display_width();
-            if seg_width <= remaining {
-                result.push(segment.text.clone(), segment.style.clone());
-                remaining -= seg_width;
-            } else {
-                // Truncate this segment
-                let mut truncated = String::new();
-                let mut width = 0;
-                for ch in segment.text.chars() {
-                    let ch_width = ch.to_string().width();
-                    if width + ch_width > remaining {
-                        break;
-                    }
-                    truncated.push(ch);
-                    width += ch_width;
-                }
-                result.push(truncated, segment.style.clone());
-                break;
-            }
-        }
-
-        result
-    }
-}
-
-// ========== FORMAT PARSING ==========
-
-/// Token from parsing a tmux-style format string
-#[derive(Debug, Clone)]
-enum FormatToken {
-    /// Style directive: #[fg=color,bg=color,bold,dim]
-    Style(InlineStyle),
-    /// Variable with optional width: {var} or {=12:var}
-    Variable { name: String, width: Option<usize> },
-    /// Plain text
-    Literal(String),
-}
-
-/// Parse a tmux-style format string into tokens
-/// Supports: #[fg=color,bg=color,bold,dim], {variable}, {=width:variable}, #{variable}
-fn parse_tmux_format(format: &str) -> Vec<FormatToken> {
-    let mut tokens = Vec::new();
-    let mut chars = format.chars().peekable();
-    let mut literal = String::new();
-
-    while let Some(ch) = chars.next() {
-        if ch == '#' {
-            match chars.peek() {
-                Some('[') => {
-                    // Flush literal
-                    if !literal.is_empty() {
-                        tokens.push(FormatToken::Literal(std::mem::take(&mut literal)));
-                    }
-                    chars.next(); // consume '['
-                    // Parse style directive until ']'
-                    let mut style_str = String::new();
-                    while let Some(&c) = chars.peek() {
-                        if c == ']' {
-                            chars.next();
-                            break;
-                        }
-                        style_str.push(chars.next().unwrap());
-                    }
-                    tokens.push(FormatToken::Style(parse_style_directive(&style_str)));
-                }
-                Some('{') => {
-                    // Flush literal
-                    if !literal.is_empty() {
-                        tokens.push(FormatToken::Literal(std::mem::take(&mut literal)));
-                    }
-                    chars.next(); // consume '{'
-                    let var_token = parse_variable(&mut chars);
-                    tokens.push(var_token);
-                }
-                _ => {
-                    literal.push(ch);
-                }
-            }
-        } else if ch == '{' {
-            // Flush literal
-            if !literal.is_empty() {
-                tokens.push(FormatToken::Literal(std::mem::take(&mut literal)));
-            }
-            let var_token = parse_variable(&mut chars);
-            tokens.push(var_token);
-        } else {
-            literal.push(ch);
-        }
-    }
-
-    if !literal.is_empty() {
-        tokens.push(FormatToken::Literal(literal));
-    }
-
-    tokens
-}
-
-/// Parse style directive content: "fg=color,bg=color,bold,dim"
-fn parse_style_directive(content: &str) -> InlineStyle {
-    let mut style = InlineStyle::default();
-
-    for part in content.split(',') {
-        let part = part.trim();
-        if part.is_empty() {
-            continue;
-        }
-
-        if let Some(color_str) = part.strip_prefix("fg=") {
-            style.fg = parse_color_spec(color_str);
-        } else if let Some(color_str) = part.strip_prefix("bg=") {
-            style.bg = parse_color_spec(color_str);
-        } else if part == "bold" {
-            style.bold = true;
-        } else if part == "dim" {
-            style.dim = true;
-        } else if part == "fill" {
-            style.fill = true;
-        } else if part == "default" || part == "none" || part == "reset" {
-            style = InlineStyle::default();
-        }
-    }
-
-    style
-}
-
-/// Parse variable content after '{': "var}" or "=12:var}"
-fn parse_variable(chars: &mut std::iter::Peekable<std::str::Chars>) -> FormatToken {
-    let mut content = String::new();
-    while let Some(&c) = chars.peek() {
-        if c == '}' {
-            chars.next();
-            break;
-        }
-        content.push(chars.next().unwrap());
-    }
-
-    // Check for width specifier: =12:varname
-    if let Some(rest) = content.strip_prefix('=')
-        && let Some(colon_pos) = rest.find(':')
-    {
-        let width_str = &rest[..colon_pos];
-        let var_name = &rest[colon_pos + 1..];
-        if let Ok(width) = width_str.parse::<usize>() {
-            return FormatToken::Variable {
-                name: var_name.to_string(),
-                width: Some(width),
-            };
-        }
-    }
-
-    FormatToken::Variable {
-        name: content,
-        width: None,
-    }
-}
-
-/// Parse a styled string like "#[fg=240]│" into StyledText
-fn parse_styled_string(s: &str) -> StyledText {
-    let tokens = parse_tmux_format(s);
-    let mut result = StyledText::new();
-    let mut current_style = InlineStyle::default();
-
-    for token in tokens {
-        match token {
-            FormatToken::Style(style) => {
-                current_style = style;
-            }
-            FormatToken::Literal(text) => {
-                result.push(text, current_style.clone());
-            }
-            FormatToken::Variable { name, .. } => {
-                // Variables in border strings are not expanded, treat as literal
-                result.push(format!("{{{}}}", name), current_style.clone());
-            }
-        }
-    }
-
-    result
-}
-
-// ========== CONFIGURATION ==========
-
-/// Styling configuration for tab labels
 #[derive(Clone)]
-struct StyleConfig {
-    format: String,
-    format_active: String,
+struct RenderConfig {
     overflow_above: String,
     overflow_below: String,
     indicator_active: String,
@@ -431,29 +17,36 @@ struct StyleConfig {
     indicator_sync: String,
     padding_top: usize,
     border: String,
-    max_name_length: usize,
-    start_index: usize,
 }
 
-impl Default for StyleConfig {
+impl Default for RenderConfig {
     fn default() -> Self {
         Self {
-            format: "{index}:{name}".to_string(),
-            format_active: "{index}:{name} {indicators}".to_string(),
             overflow_above: "  ^ +{count}".to_string(),
             overflow_below: "  v +{count}".to_string(),
             indicator_active: "*".to_string(),
             indicator_fullscreen: "Z".to_string(),
             indicator_sync: "S".to_string(),
-            max_name_length: 20,
             padding_top: 0,
             border: String::new(),
-            start_index: 1,
         }
     }
 }
 
-// ========== PLUGIN STATE ==========
+#[derive(Clone)]
+struct TabRowState {
+    cells: Vec<Option<CellState>>,
+    last_mirrored_tab_name: Option<String>,
+}
+
+impl TabRowState {
+    fn empty(schema: &Schema) -> Self {
+        Self {
+            cells: vec![None; schema.len()],
+            last_mirrored_tab_name: None,
+        }
+    }
+}
 
 #[derive(Default)]
 struct State {
@@ -461,58 +54,56 @@ struct State {
     active_tab_idx: usize,
     mode_info: ModeInfo,
     pane_manifest: PaneManifest,
-    style: StyleConfig,
+    render: RenderConfig,
+    schema: Option<Schema>,
+    rows_by_tab_position: BTreeMap<usize, TabRowState>,
+    pane_to_tab_position: BTreeMap<u32, usize>,
+    width_indexes: Vec<WidthIndex>,
     last_rows: usize,
     permissions_granted: bool,
     is_selectable: bool,
     pending_events: Vec<Event>,
+    load_error: Option<String>,
 }
 
 register_plugin!(State);
 
 impl ZellijPlugin for State {
     fn load(&mut self, configuration: BTreeMap<String, String>) {
-        // Parse style configuration
-        if let Some(v) = configuration.get("format") {
-            self.style.format = v.clone();
+        if let Some(value) = configuration.get("overflow_above") {
+            self.render.overflow_above = value.clone();
         }
-        if let Some(v) = configuration.get("format_active") {
-            self.style.format_active = v.clone();
+        if let Some(value) = configuration.get("overflow_below") {
+            self.render.overflow_below = value.clone();
         }
-        if let Some(v) = configuration.get("overflow_above") {
-            self.style.overflow_above = v.clone();
+        if let Some(value) = configuration.get("indicator_active") {
+            self.render.indicator_active = value.clone();
         }
-        if let Some(v) = configuration.get("overflow_below") {
-            self.style.overflow_below = v.clone();
+        if let Some(value) = configuration.get("indicator_fullscreen") {
+            self.render.indicator_fullscreen = value.clone();
         }
-        if let Some(v) = configuration.get("indicator_active") {
-            self.style.indicator_active = v.clone();
+        if let Some(value) = configuration.get("indicator_sync") {
+            self.render.indicator_sync = value.clone();
         }
-        if let Some(v) = configuration.get("indicator_fullscreen") {
-            self.style.indicator_fullscreen = v.clone();
-        }
-        if let Some(v) = configuration.get("indicator_sync") {
-            self.style.indicator_sync = v.clone();
-        }
-        if let Some(v) = configuration.get("max_name_length")
-            && let Ok(n) = v.parse::<usize>()
+        if let Some(value) = configuration.get("padding_top")
+            && let Ok(padding_top) = value.parse::<usize>()
         {
-            self.style.max_name_length = n;
+            self.render.padding_top = padding_top;
         }
-        if let Some(v) = configuration.get("padding_top")
-            && let Ok(n) = v.parse::<usize>()
-        {
-            self.style.padding_top = n;
+        if let Some(value) = configuration.get("border") {
+            self.render.border = value.clone();
+        } else if let Some(value) = configuration.get("border_char") {
+            self.render.border = value.clone();
         }
-        if let Some(v) = configuration.get("border") {
-            self.style.border = v.clone();
-        } else if let Some(v) = configuration.get("border_char") {
-            self.style.border = v.clone();
-        }
-        if let Some(v) = configuration.get("start_index")
-            && let Ok(n) = v.parse::<usize>()
-        {
-            self.style.start_index = n;
+
+        match Schema::from_config(&configuration) {
+            Ok(schema) => {
+                self.width_indexes = vec![WidthIndex::default(); schema.len()];
+                self.schema = Some(schema);
+            }
+            Err(error) => {
+                self.load_error = Some(format!("super-tabs config error: {error}"));
+            }
         }
 
         request_permission(&[
@@ -561,27 +152,31 @@ impl ZellijPlugin for State {
                 self.mode_info = mode_info;
             }
             Event::TabUpdate(tabs) => {
-                let active_tab_index = tabs.iter().position(|t| t.active).unwrap_or(0);
+                let active_tab_index = tabs.iter().position(|tab| tab.active).unwrap_or(0);
                 let active_tab_idx = active_tab_index + 1;
                 if self.active_tab_idx != active_tab_idx || self.tabs != tabs {
                     should_render = true;
                 }
                 self.active_tab_idx = active_tab_idx;
                 self.tabs = tabs;
+                if self.reconcile_rows_with_tabs() {
+                    should_render = true;
+                }
             }
             Event::PaneUpdate(pane_manifest) => {
                 self.pane_manifest = pane_manifest;
+                self.rebuild_pane_lookup();
                 should_render = true;
             }
-            Event::Mouse(me) => match me {
+            Event::Mouse(mouse_event) => match mouse_event {
                 Mouse::LeftClick(row, _col) => {
-                    if let Some(idx) = self.get_tab_at_row(row as usize) {
-                        switch_tab_to(idx as u32);
+                    if let Some(index) = self.get_tab_at_row(row as usize) {
+                        switch_tab_to(index as u32);
                     }
                 }
                 Mouse::ScrollUp(_) => {
-                    let prev_tab = max(self.active_tab_idx.saturating_sub(1), 1);
-                    switch_tab_to(prev_tab as u32);
+                    let previous_tab = max(self.active_tab_idx.saturating_sub(1), 1);
+                    switch_tab_to(previous_tab as u32);
                 }
                 Mouse::ScrollDown(_) => {
                     let next_tab = min(self.active_tab_idx + 1, self.tabs.len());
@@ -591,11 +186,13 @@ impl ZellijPlugin for State {
             },
             _ => {}
         }
+
         should_render
     }
 
     fn pipe(&mut self, pipe_message: PipeMessage) -> bool {
         match pipe_message.name.as_str() {
+            PIPE_NAME => self.handle_update_pipe(pipe_message.payload.as_deref()),
             "set_selectable" => {
                 match pipe_message.payload.as_deref() {
                     Some("true") => {
@@ -622,7 +219,21 @@ impl ZellijPlugin for State {
     fn render(&mut self, rows: usize, cols: usize) {
         self.last_rows = rows;
 
-        if !self.permissions_granted || self.tabs.is_empty() {
+        if !self.permissions_granted {
+            self.render_message(
+                rows,
+                cols,
+                "super-tabs: waiting for ReadApplicationState + ChangeApplicationState permissions",
+            );
+            return;
+        }
+
+        if let Some(error) = self.load_error.as_deref() {
+            self.render_message(rows, cols, error);
+            return;
+        }
+
+        if self.tabs.is_empty() {
             return;
         }
 
@@ -632,148 +243,258 @@ impl ZellijPlugin for State {
 
 impl State {
     fn get_focused_pane_title(&self, tab_position: usize) -> Option<String> {
-        if let Some(panes) = self.pane_manifest.panes.get(&tab_position) {
-            for pane in panes {
-                if pane.is_focused && !pane.is_plugin {
-                    let title = &pane.title;
-                    if title.starts_with("Pane #") || title.starts_with("Tab #") || title.is_empty()
-                    {
-                        return None;
-                    }
-                    return Some(title.clone());
+        let panes = self.pane_manifest.panes.get(&tab_position)?;
+        for pane in panes {
+            if pane.is_focused && !pane.is_plugin {
+                let title = pane.title.trim();
+                if title.is_empty() || title.starts_with("Pane #") || title.starts_with("Tab #") {
+                    return None;
                 }
+                return Some(title.to_string());
             }
         }
         None
+    }
+
+    fn rebuild_pane_lookup(&mut self) {
+        self.pane_to_tab_position.clear();
+
+        for (tab_position, panes) in &self.pane_manifest.panes {
+            for pane in panes {
+                self.pane_to_tab_position.insert(pane.id, *tab_position);
+            }
+        }
+    }
+
+    fn reconcile_rows_with_tabs(&mut self) -> bool {
+        let Some(schema) = self.schema.clone() else {
+            return false;
+        };
+
+        let live_positions: BTreeSet<usize> = self.tabs.iter().map(|tab| tab.position).collect();
+        let stale_positions: Vec<usize> = self
+            .rows_by_tab_position
+            .keys()
+            .copied()
+            .filter(|position| !live_positions.contains(position))
+            .collect();
+
+        let mut changed = false;
+
+        for stale_position in stale_positions {
+            if let Some(row) = self.rows_by_tab_position.remove(&stale_position) {
+                self.remove_row_widths(&row);
+                changed = true;
+            }
+        }
+
+        for tab in &self.tabs {
+            if self.rows_by_tab_position.contains_key(&tab.position) {
+                continue;
+            }
+
+            let Some(parsed_name) = decode_tab_name(&tab.name) else {
+                continue;
+            };
+
+            let mut row = TabRowState::empty(&schema);
+            let mut recognized_value = false;
+
+            for (index, column) in schema.columns().iter().enumerate() {
+                let plain_value = parsed_name.get(&column.name).cloned().unwrap_or_default();
+                if plain_value.is_empty() {
+                    continue;
+                }
+
+                recognized_value = true;
+                let cell = CellState::from_plain_text(plain_value, &column.default_style);
+                self.width_indexes[index].replace(None, cell.display_width());
+                row.cells[index] = Some(cell);
+            }
+
+            if !recognized_value {
+                continue;
+            }
+
+            row.last_mirrored_tab_name = Some(tab.name.clone());
+            self.rows_by_tab_position.insert(tab.position, row);
+            changed = true;
+        }
+
+        changed
+    }
+
+    fn remove_row_widths(&mut self, row: &TabRowState) {
+        for (index, cell) in row.cells.iter().enumerate() {
+            if let Some(cell) = cell {
+                self.width_indexes[index].remove(cell.display_width());
+            }
+        }
+    }
+
+    fn handle_update_pipe(&mut self, payload: Option<&str>) -> bool {
+        let Some(schema) = self.schema.clone() else {
+            return false;
+        };
+        let Some(payload) = payload else {
+            return false;
+        };
+        let Ok(payload) = UpdatePayload::parse(payload) else {
+            return false;
+        };
+        let Some(&tab_position) = self.pane_to_tab_position.get(&payload.pane_id) else {
+            return false;
+        };
+
+        let mut row = self
+            .rows_by_tab_position
+            .remove(&tab_position)
+            .unwrap_or_else(|| TabRowState::empty(&schema));
+        let mut changed = false;
+
+        for (column_name, raw_value) in payload.updates {
+            let Some(index) = schema.index_of(&column_name) else {
+                continue;
+            };
+
+            let column = &schema.columns()[index];
+            let cell = CellState::from_raw(raw_value, &column.default_style);
+            let old_width = row.cells[index].as_ref().map(CellState::display_width);
+            self.width_indexes[index].replace(old_width, cell.display_width());
+            row.cells[index] = Some(cell);
+            changed = true;
+        }
+
+        if !changed {
+            self.rows_by_tab_position.insert(tab_position, row);
+            return false;
+        }
+
+        let mirrored_name = encode_tab_name(schema.columns(), &row.cells);
+        row.last_mirrored_tab_name = Some(mirrored_name.clone());
+        self.rows_by_tab_position.insert(tab_position, row);
+        self.rename_live_tab(tab_position, &mirrored_name);
+        true
+    }
+
+    fn rename_live_tab(&self, tab_position: usize, mirrored_name: &str) {
+        rename_tab(tab_position as u32, mirrored_name.to_string());
     }
 
     fn expand_overflow_format(&self, format: &str, count: usize) -> String {
         format.replace("{count}", &count.to_string())
     }
 
-    /// Expand a tmux-style format string with tab info, returning styled text
-    fn expand_tmux_format(&self, format: &str, tab: &TabInfo, index: usize) -> StyledText {
-        let tokens = parse_tmux_format(format);
-        let mut result = StyledText::new();
-        let mut current_style = InlineStyle::default();
-
-        // Get focused pane title for this tab
-        let pane_title = self
-            .get_focused_pane_title(tab.position)
-            .or_else(|| {
-                if !tab.name.starts_with("Tab #") {
-                    Some(tab.name.clone())
-                } else {
-                    None
-                }
-            })
-            .unwrap_or_else(|| "...".to_string());
-
-        // Build indicators string
+    fn build_indicator_text(&self, tab: &TabInfo) -> String {
         let mut indicators = String::new();
         if tab.is_fullscreen_active {
-            indicators.push_str(&self.style.indicator_fullscreen);
+            indicators.push_str(&self.render.indicator_fullscreen);
         }
         if tab.is_sync_panes_active {
-            indicators.push_str(&self.style.indicator_sync);
+            indicators.push_str(&self.render.indicator_sync);
         }
         if tab.active {
-            indicators.push_str(&self.style.indicator_active);
+            indicators.push_str(&self.render.indicator_active);
         }
+        indicators
+    }
 
-        for token in tokens {
-            match token {
-                FormatToken::Style(style) => {
-                    current_style = style;
-                }
-                FormatToken::Variable { name, width } => {
-                    let value = match name.as_str() {
-                        "index" | "i" => index.to_string(),
-                        "name" | "n" => {
-                            if tab.active
-                                && self.mode_info.mode == InputMode::RenameTab
-                                && tab.name.is_empty()
-                            {
-                                "Enter name...".to_string()
-                            } else if !tab.name.starts_with("Tab #") && !tab.name.is_empty() {
-                                tab.name.clone()
-                            } else {
-                                pane_title.clone()
-                            }
-                        }
-                        "title" | "t" | "pane_title" => pane_title.clone(),
-                        "indicators" => indicators.clone(),
-                        "fullscreen" => {
-                            if tab.is_fullscreen_active {
-                                self.style.indicator_fullscreen.clone()
-                            } else {
-                                String::new()
-                            }
-                        }
-                        "sync" => {
-                            if tab.is_sync_panes_active {
-                                self.style.indicator_sync.clone()
-                            } else {
-                                String::new()
-                            }
-                        }
-                        "active" => {
-                            if tab.active {
-                                self.style.indicator_active.clone()
-                            } else {
-                                String::new()
-                            }
-                        }
-                        _ => format!("{{{}}}", name),
-                    };
+    fn max_indicator_width(&self) -> usize {
+        let mut indicator_text = String::new();
+        indicator_text.push_str(&self.render.indicator_fullscreen);
+        indicator_text.push_str(&self.render.indicator_sync);
+        indicator_text.push_str(&self.render.indicator_active);
+        parse_styled_string(&indicator_text).display_width()
+    }
 
-                    let text = if let Some(w) = width {
-                        truncate_string(&value, w)
-                    } else {
-                        truncate_string(&value, self.style.max_name_length)
-                    };
+    fn render_tab_content(&self, tab: &TabInfo, cols: usize) -> StyledText {
+        let Some(schema) = self.schema.as_ref() else {
+            return StyledText::plain(tab.name.clone());
+        };
+        let Some(row) = self.rows_by_tab_position.get(&tab.position) else {
+            return self.render_unmanaged_row(tab);
+        };
 
-                    result.push(text, current_style.clone());
-                }
-                FormatToken::Literal(text) => {
-                    result.push(text, current_style.clone());
-                }
+        let border_width = parse_styled_string(&self.render.border).display_width();
+        let indicator_width = self.max_indicator_width();
+        let indicator_padding = usize::from(indicator_width > 0);
+        let available_width = cols
+            .saturating_sub(border_width)
+            .saturating_sub(indicator_width + indicator_padding);
+        let natural_widths: Vec<usize> = self.width_indexes.iter().map(WidthIndex::max).collect();
+        let column_widths =
+            solve_column_widths(schema.columns(), &natural_widths, available_width, 1);
+
+        let mut content = StyledText::new();
+        for (index, column) in schema.columns().iter().enumerate() {
+            let styled = row.cells[index]
+                .as_ref()
+                .map(|cell| cell.styled_text.clone())
+                .unwrap_or_else(|| apply_default_style(&column.default_style, ""));
+            let fitted = fit_cell_to_width(&styled, column.resize_spec, column_widths[index]);
+            let fitted_width = fitted.display_width();
+            content.extend(fitted);
+
+            let padding = column_widths[index].saturating_sub(fitted_width);
+            if padding > 0 {
+                content.push_plain(" ".repeat(padding));
+            }
+
+            if index + 1 < schema.len() {
+                content.push_plain(" ");
             }
         }
 
-        result
+        let indicators = self.build_indicator_text(tab);
+        if !indicators.is_empty() {
+            if !schema.is_empty() {
+                content.push_plain(" ");
+            }
+            content.extend(parse_styled_string(&indicators));
+        }
+
+        clip_right_edge(&content, cols.saturating_sub(border_width))
     }
 
-    /// Build a complete line with content, padding, and border
+    fn render_unmanaged_row(&self, tab: &TabInfo) -> StyledText {
+        let fallback_name = if !tab.name.trim().is_empty() && !tab.name.starts_with("Tab #") {
+            tab.name.clone()
+        } else {
+            self.get_focused_pane_title(tab.position)
+                .unwrap_or_else(|| format!("Tab {}", tab.position))
+        };
+
+        let mut content = StyledText::plain(fallback_name);
+        let indicators = self.build_indicator_text(tab);
+        if !indicators.is_empty() {
+            if !content.plain_text().is_empty() {
+                content.push_plain(" ");
+            }
+            content.extend(parse_styled_string(&indicators));
+        }
+        content
+    }
+
     fn build_line(&self, content: &StyledText, cols: usize, is_selected: bool) -> String {
-        let border = parse_styled_string(&self.style.border);
+        let border = parse_styled_string(&self.render.border);
         let border_width = border.display_width();
-
         let effective_cols = cols.saturating_sub(border_width);
-
-        // Truncate content if it exceeds available width to prevent wrapping
-        let content = content.truncate(effective_cols);
+        let content = clip_right_edge(content, effective_cols);
         let content_width = content.display_width();
         let padding_needed = effective_cols.saturating_sub(content_width);
-
         let mut line = String::new();
-
-        // Check if any segment has fill attribute - fills entire row with bg color
-        let has_fill = is_selected && content.segments.iter().any(|s| s.style.fill);
+        let has_fill = is_selected && content.segments.iter().any(|segment| segment.style.fill);
 
         if has_fill {
-            // Fill mode: use reverse video with swapped colors so bg fills the row
-            // User writes #[bg=236,fill] -> we swap to fg=236 -> reverse makes displayed bg=236
             line.push_str("\x1b[7m");
 
             for segment in &content.segments {
-                // Swap fg and bg for reverse video
                 let mut swapped_style = segment.style.clone();
                 std::mem::swap(&mut swapped_style.fg, &mut swapped_style.bg);
-                swapped_style.fill = false; // Don't need fill flag in output
+                swapped_style.fill = false;
 
                 if swapped_style.has_any_style() {
-                    line.push_str("\x1b[0m\x1b[7m"); // Reset and re-apply reverse
+                    line.push_str("\x1b[0m\x1b[7m");
                     line.push_str(&swapped_style.to_ansi());
                 }
                 line.push_str(&segment.text);
@@ -785,15 +506,12 @@ impl State {
 
             line.push_str("\x1b[0m");
         } else {
-            // Normal rendering - bg colors only apply to text, not padding
             line.push_str(&content.to_ansi());
-
             if padding_needed > 0 {
                 line.push_str(&" ".repeat(padding_needed));
             }
         }
 
-        // Add border (not affected by selection)
         if border_width > 0 {
             line.push_str(&border.to_ansi());
         }
@@ -801,9 +519,8 @@ impl State {
         line
     }
 
-    /// Build a line with just the border (for empty rows)
     fn build_empty_line(&self, cols: usize) -> String {
-        let border = parse_styled_string(&self.style.border);
+        let border = parse_styled_string(&self.render.border);
         let border_width = border.display_width();
 
         if border_width == 0 {
@@ -816,62 +533,61 @@ impl State {
         line
     }
 
-    fn render_vertical(&mut self, rows: usize, cols: usize) {
-        let top_padding = self.style.padding_top;
-        let available_rows = rows.saturating_sub(top_padding);
-
-        let tab_count = self.tabs.len();
-        let active_index = self.active_tab_idx.saturating_sub(1);
-
-        let (start_index, end_index, tabs_above, tabs_below) =
-            calculate_visible_range(tab_count, available_rows, active_index);
-
-        let mut lines: Vec<String> = Vec::with_capacity(rows);
-
-        // Add top padding lines
-        for _ in 0..top_padding {
-            lines.push(self.build_empty_line(cols));
-        }
-
-        // Render "above" overflow indicator
-        if tabs_above > 0 {
-            let indicator_text =
-                self.expand_overflow_format(&self.style.overflow_above, tabs_above);
-            let styled = parse_styled_string(&indicator_text);
-            lines.push(self.build_line(&styled, cols, false));
-        }
-
-        // Render visible tabs
-        for i in start_index..end_index {
-            if let Some(tab) = self.tabs.get(i).cloned() {
-                let is_active = tab.active;
-                let format = if is_active {
-                    &self.style.format_active
-                } else {
-                    &self.style.format
-                };
-
-                let styled = self.expand_tmux_format(format, &tab, i + self.style.start_index);
-                lines.push(self.build_line(&styled, cols, is_active));
-            }
-        }
-
-        // Render "below" overflow indicator
-        if tabs_below > 0 {
-            let indicator_text =
-                self.expand_overflow_format(&self.style.overflow_below, tabs_below);
-            let styled = parse_styled_string(&indicator_text);
-            lines.push(self.build_line(&styled, cols, false));
-        }
-
-        // Fill remaining rows with empty lines (just border)
+    fn render_message(&self, rows: usize, cols: usize, message: &str) {
+        let mut lines = vec![self.build_line(&StyledText::plain(message), cols, false)];
         while lines.len() < rows {
             lines.push(self.build_empty_line(cols));
         }
 
-        // Print all lines with ANSI styling
-        for (i, line) in lines.iter().enumerate() {
-            if i < lines.len() - 1 {
+        for (index, line) in lines.iter().enumerate() {
+            if index + 1 < lines.len() {
+                println!("{}\x1b[m", line);
+            } else {
+                print!("{}\x1b[m", line);
+            }
+        }
+    }
+
+    fn render_vertical(&mut self, rows: usize, cols: usize) {
+        let top_padding = self.render.padding_top;
+        let available_rows = rows.saturating_sub(top_padding);
+        let tab_count = self.tabs.len();
+        let active_index = self.active_tab_idx.saturating_sub(1);
+        let (start_index, end_index, tabs_above, tabs_below) =
+            calculate_visible_range(tab_count, available_rows, active_index);
+        let mut lines: Vec<String> = Vec::with_capacity(rows);
+
+        for _ in 0..top_padding {
+            lines.push(self.build_empty_line(cols));
+        }
+
+        if tabs_above > 0 {
+            let indicator_text =
+                self.expand_overflow_format(&self.render.overflow_above, tabs_above);
+            let styled = parse_styled_string(&indicator_text);
+            lines.push(self.build_line(&styled, cols, false));
+        }
+
+        for index in start_index..end_index {
+            if let Some(tab) = self.tabs.get(index) {
+                let content = self.render_tab_content(tab, cols);
+                lines.push(self.build_line(&content, cols, tab.active));
+            }
+        }
+
+        if tabs_below > 0 {
+            let indicator_text =
+                self.expand_overflow_format(&self.render.overflow_below, tabs_below);
+            let styled = parse_styled_string(&indicator_text);
+            lines.push(self.build_line(&styled, cols, false));
+        }
+
+        while lines.len() < rows {
+            lines.push(self.build_empty_line(cols));
+        }
+
+        for (index, line) in lines.iter().enumerate() {
+            if index + 1 < lines.len() {
                 println!("{}\x1b[m", line);
             } else {
                 print!("{}\x1b[m", line);
@@ -880,19 +596,19 @@ impl State {
     }
 
     fn get_tab_at_row(&self, row: usize) -> Option<usize> {
-        if self.tabs.is_empty() {
+        if self.tabs.is_empty() || row < self.render.padding_top {
             return None;
         }
 
+        let available_rows = self.last_rows.saturating_sub(self.render.padding_top);
         let tab_count = self.tabs.len();
         let active_index = self.active_tab_idx.saturating_sub(1);
-
         let (start_index, end_index, tabs_above, _tabs_below) =
-            calculate_visible_range(tab_count, self.last_rows, active_index);
+            calculate_visible_range(tab_count, available_rows, active_index);
 
-        let content_start_row = if tabs_above > 0 { 1 } else { 0 };
+        let content_start_row = self.render.padding_top + usize::from(tabs_above > 0);
 
-        if tabs_above > 0 && row == 0 {
+        if tabs_above > 0 && row == self.render.padding_top {
             let target = start_index.saturating_sub(1);
             return Some(target + 1);
         }
@@ -904,7 +620,7 @@ impl State {
             return Some(clicked_tab_index + 1);
         }
 
-        if row_in_content >= end_index - start_index {
+        if row_in_content >= end_index.saturating_sub(start_index) {
             let target = end_index.min(tab_count.saturating_sub(1));
             return Some(target + 1);
         }
@@ -961,27 +677,4 @@ fn calculate_visible_range(
         start_index,
         tab_count.saturating_sub(end_index),
     )
-}
-
-fn truncate_string(s: &str, max_width: usize) -> String {
-    if s.width() <= max_width {
-        return s.to_string();
-    }
-
-    if max_width <= 3 {
-        return ".".repeat(max_width);
-    }
-
-    let mut truncated = String::new();
-    let mut width = 0;
-    for ch in s.chars() {
-        let ch_width = ch.to_string().width();
-        if width + ch_width + 3 > max_width {
-            truncated.push_str("...");
-            break;
-        }
-        truncated.push(ch);
-        width += ch_width;
-    }
-    truncated
 }

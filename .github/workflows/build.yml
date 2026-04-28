@@ -30,13 +30,13 @@ jobs:
           key: wasm32-wasip1
 
       - name: Build plugin
-        run: cargo build --release --target wasm32-wasip1
+        run: cargo build --release --target wasm32-wasip1 -p super-tabs
 
       - name: Verify plugin exists
         run: |
-          if [ -f "target/wasm32-wasip1/release/zellij-vertical-tabs.wasm" ]; then
-            echo "Plugin found: target/wasm32-wasip1/release/zellij-vertical-tabs.wasm"
-            ls -la "target/wasm32-wasip1/release/zellij-vertical-tabs.wasm"
+          if [ -f "target/wasm32-wasip1/release/super-tabs.wasm" ]; then
+            echo "Plugin found: target/wasm32-wasip1/release/super-tabs.wasm"
+            ls -la "target/wasm32-wasip1/release/super-tabs.wasm"
           else
             echo "Plugin not found!"
             echo "Contents of release directory:"
@@ -47,8 +47,8 @@ jobs:
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: zellij-vertical-tabs-wasm32-wasip1
-          path: target/wasm32-wasip1/release/zellij-vertical-tabs.wasm
+          name: super-tabs-wasm32-wasip1
+          path: target/wasm32-wasip1/release/super-tabs.wasm
           if-no-files-found: error
 
   release:
