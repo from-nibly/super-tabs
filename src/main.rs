@@ -1,12 +1,19 @@
 use std::cmp::{max, min};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
+use std::fs::{self, File};
+use std::io::Write;
+use std::path::PathBuf;
 
+use serde::{Deserialize, Serialize};
 use super_tabs_core::{
     CellState, PIPE_NAME, Schema, StyledText, UpdatePayload, WidthIndex, apply_default_style,
     clip_right_edge, decode_tab_name, encode_tab_name, fit_cell_to_width, parse_styled_string,
     solve_column_widths,
 };
 use zellij_tile::prelude::*;
+
+const STATE_DIR: &str = "/data/super-tabs";
+const STATE_FILE_PREFIX: &str = "tab-";
 
 #[derive(Clone)]
 struct RenderConfig {
@@ -33,7 +40,7 @@ impl Default for RenderConfig {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 struct TabRowState {
     cells: Vec<Option<CellState>>,
     last_mirrored_tab_name: Option<String>,
@@ -48,6 +55,13 @@ impl TabRowState {
     }
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+struct PersistedTabState {
+    version: u8,
+    mirrored_name: String,
+    cells: BTreeMap<String, String>,
+}
+
 #[derive(Default)]
 struct State {
     tabs: Vec<TabInfo>,
@@ -56,6 +70,8 @@ struct State {
     pane_manifest: PaneManifest,
     render: RenderConfig,
     schema: Option<Schema>,
+    plugin_id: Option<u32>,
+    debug_enabled: bool,
     rows_by_tab_position: BTreeMap<usize, TabRowState>,
     pane_to_tab_position: BTreeMap<u32, usize>,
     width_indexes: Vec<WidthIndex>,
@@ -70,6 +86,11 @@ register_plugin!(State);
 
 impl ZellijPlugin for State {
     fn load(&mut self, configuration: BTreeMap<String, String>) {
+        self.plugin_id = Some(get_plugin_ids().plugin_id);
+        if let Some(value) = configuration.get("debug") {
+            self.debug_enabled = parse_bool_config(value);
+        }
+
         if let Some(value) = configuration.get("overflow_above") {
             self.render.overflow_above = value.clone();
         }
@@ -99,6 +120,15 @@ impl ZellijPlugin for State {
         match Schema::from_config(&configuration) {
             Ok(schema) => {
                 self.width_indexes = vec![WidthIndex::default(); schema.len()];
+                self.debug_log(format!(
+                    "load plugin_id={:?} columns={:?}",
+                    self.plugin_id,
+                    schema
+                        .columns()
+                        .iter()
+                        .map(|column| column.name.as_str())
+                        .collect::<Vec<_>>()
+                ));
                 self.schema = Some(schema);
             }
             Err(error) => {
@@ -117,6 +147,7 @@ impl ZellijPlugin for State {
             EventType::ModeUpdate,
             EventType::Mouse,
             EventType::PermissionRequestResult,
+            EventType::Visible,
         ]);
     }
 
@@ -124,6 +155,7 @@ impl ZellijPlugin for State {
         let mut should_render = false;
 
         if let Event::PermissionRequestResult(status) = event {
+            self.debug_log(format!("permission_result={status:?}"));
             if status == PermissionStatus::Granted {
                 self.permissions_granted = true;
                 self.is_selectable = false;
@@ -150,8 +182,22 @@ impl ZellijPlugin for State {
                     should_render = true;
                 }
                 self.mode_info = mode_info;
+                self.debug_log(format!(
+                    "mode_update session={:?}",
+                    self.mode_info.session_name
+                ));
             }
+            Event::Visible(is_visible) if is_visible && self.reconcile_rows_with_tabs() => {
+                should_render = true;
+            }
+            Event::Visible(_) => {}
             Event::TabUpdate(tabs) => {
+                self.debug_log(format!(
+                    "tab_update {:?}",
+                    tabs.iter()
+                        .map(|tab| (tab.position, tab.active, tab.name.as_str()))
+                        .collect::<Vec<_>>()
+                ));
                 let active_tab_index = tabs.iter().position(|tab| tab.active).unwrap_or(0);
                 let active_tab_idx = active_tab_index + 1;
                 if self.active_tab_idx != active_tab_idx || self.tabs != tabs {
@@ -159,6 +205,7 @@ impl ZellijPlugin for State {
                 }
                 self.active_tab_idx = active_tab_idx;
                 self.tabs = tabs;
+                self.rebuild_pane_lookup();
                 if self.reconcile_rows_with_tabs() {
                     should_render = true;
                 }
@@ -166,6 +213,10 @@ impl ZellijPlugin for State {
             Event::PaneUpdate(pane_manifest) => {
                 self.pane_manifest = pane_manifest;
                 self.rebuild_pane_lookup();
+                self.debug_log(format!(
+                    "pane_update lookup={:?}",
+                    self.pane_to_tab_position
+                ));
                 should_render = true;
             }
             Event::Mouse(mouse_event) => match mouse_event {
@@ -242,6 +293,30 @@ impl ZellijPlugin for State {
 }
 
 impl State {
+    fn debug_log(&self, message: impl AsRef<str>) {
+        if !self.debug_enabled {
+            return;
+        }
+
+        let plugin_id = self
+            .plugin_id
+            .map(|id| id.to_string())
+            .unwrap_or_else(|| "?".to_string());
+        let own_tab = self
+            .own_plugin_tab_position()
+            .map(|position| position.to_string())
+            .unwrap_or_else(|| "?".to_string());
+        let session = self
+            .mode_info
+            .session_name
+            .clone()
+            .unwrap_or_else(|| "?".to_string());
+        eprintln!(
+            "[super-tabs][session={session}][plugin={plugin_id}][own-tab={own_tab}] {}",
+            message.as_ref()
+        );
+    }
+
     fn get_focused_pane_title(&self, tab_position: usize) -> Option<String> {
         let panes = self.pane_manifest.panes.get(&tab_position)?;
         for pane in panes {
@@ -257,13 +332,7 @@ impl State {
     }
 
     fn rebuild_pane_lookup(&mut self) {
-        self.pane_to_tab_position.clear();
-
-        for (tab_position, panes) in &self.pane_manifest.panes {
-            for pane in panes {
-                self.pane_to_tab_position.insert(pane.id, *tab_position);
-            }
-        }
+        self.pane_to_tab_position = build_terminal_pane_lookup(&self.pane_manifest);
     }
 
     fn reconcile_rows_with_tabs(&mut self) -> bool {
@@ -271,64 +340,165 @@ impl State {
             return false;
         };
 
-        let live_positions: BTreeSet<usize> = self.tabs.iter().map(|tab| tab.position).collect();
-        let stale_positions: Vec<usize> = self
-            .rows_by_tab_position
-            .keys()
-            .copied()
-            .filter(|position| !live_positions.contains(position))
-            .collect();
-
-        let mut changed = false;
-
-        for stale_position in stale_positions {
-            if let Some(row) = self.rows_by_tab_position.remove(&stale_position) {
-                self.remove_row_widths(&row);
-                changed = true;
-            }
-        }
+        let mut next_rows = BTreeMap::new();
+        let mut next_width_indexes = vec![WidthIndex::default(); schema.len()];
 
         for tab in &self.tabs {
-            if self.rows_by_tab_position.contains_key(&tab.position) {
-                continue;
-            }
-
-            let Some(parsed_name) = decode_tab_name(&tab.name) else {
+            let Some(row) = self.load_row_state_for_tab(tab, &schema) else {
                 continue;
             };
-
-            let mut row = TabRowState::empty(&schema);
-            let mut recognized_value = false;
-
-            for (index, column) in schema.columns().iter().enumerate() {
-                let plain_value = parsed_name.get(&column.name).cloned().unwrap_or_default();
-                if plain_value.is_empty() {
-                    continue;
-                }
-
-                recognized_value = true;
-                let cell = CellState::from_plain_text(plain_value, &column.default_style);
-                self.width_indexes[index].replace(None, cell.display_width());
-                row.cells[index] = Some(cell);
-            }
-
-            if !recognized_value {
-                continue;
-            }
-
-            row.last_mirrored_tab_name = Some(tab.name.clone());
-            self.rows_by_tab_position.insert(tab.position, row);
-            changed = true;
+            add_row_widths_to_indexes(&mut next_width_indexes, &row);
+            next_rows.insert(tab.position, row);
         }
 
+        let changed =
+            self.rows_by_tab_position != next_rows || self.width_indexes != next_width_indexes;
+        self.rows_by_tab_position = next_rows;
+        self.width_indexes = next_width_indexes;
         changed
     }
 
-    fn remove_row_widths(&mut self, row: &TabRowState) {
-        for (index, cell) in row.cells.iter().enumerate() {
-            if let Some(cell) = cell {
-                self.width_indexes[index].remove(cell.display_width());
+    fn load_row_state_for_tab(&self, tab: &TabInfo, schema: &Schema) -> Option<TabRowState> {
+        if let Some(row) = self.read_persisted_row(tab.position, tab, schema) {
+            self.debug_log(format!(
+                "hydrate tab={} source=cache name={}",
+                tab.position, tab.name
+            ));
+            return Some(row);
+        }
+
+        let row = self.build_row_state_from_tab_name(tab, schema);
+        if row.is_some() {
+            self.debug_log(format!(
+                "hydrate tab={} source=tab-name name={}",
+                tab.position, tab.name
+            ));
+        }
+        row
+    }
+
+    fn build_row_state_from_tab_name(&self, tab: &TabInfo, schema: &Schema) -> Option<TabRowState> {
+        let parsed_name = decode_tab_name(&tab.name)?;
+        let mut row = TabRowState::empty(schema);
+        let mut recognized_value = false;
+
+        for (index, column) in schema.columns().iter().enumerate() {
+            let plain_value = parsed_name.get(&column.name).cloned().unwrap_or_default();
+            if plain_value.is_empty() {
+                continue;
             }
+
+            recognized_value = true;
+            row.cells[index] = Some(CellState::from_plain_text(
+                plain_value,
+                &column.default_style,
+            ));
+        }
+
+        if !recognized_value {
+            return None;
+        }
+
+        row.last_mirrored_tab_name = Some(tab.name.clone());
+        Some(row)
+    }
+
+    fn read_persisted_row(
+        &self,
+        tab_position: usize,
+        tab: &TabInfo,
+        schema: &Schema,
+    ) -> Option<TabRowState> {
+        let session_key = self.session_key()?;
+        let path = persisted_tab_state_path(session_key.as_str(), tab_position);
+        let persisted = read_persisted_tab_state(session_key.as_str(), tab_position)?;
+        if persisted.version != 1 || persisted.mirrored_name != tab.name {
+            self.debug_log(format!(
+                "cache_miss tab={} path={} mirrored_name={} live_name={}",
+                tab_position,
+                path.display(),
+                persisted.mirrored_name,
+                tab.name
+            ));
+            return None;
+        }
+
+        let mut row = TabRowState::empty(schema);
+        for (index, column) in schema.columns().iter().enumerate() {
+            let Some(raw_input) = persisted.cells.get(&column.name) else {
+                continue;
+            };
+            row.cells[index] = Some(CellState::from_raw(
+                raw_input.clone(),
+                &column.default_style,
+            ));
+        }
+        row.last_mirrored_tab_name = Some(persisted.mirrored_name);
+        Some(row)
+    }
+
+    fn own_plugin_tab_position(&self) -> Option<usize> {
+        let plugin_id = self.plugin_id?;
+        self.pane_manifest
+            .panes
+            .iter()
+            .find_map(|(tab_position, panes)| {
+                panes
+                    .iter()
+                    .any(|pane| pane.is_plugin && pane.id == plugin_id)
+                    .then_some(*tab_position)
+            })
+    }
+
+    fn write_persisted_row(
+        &self,
+        tab_position: usize,
+        mirrored_name: &str,
+        row: &TabRowState,
+        schema: &Schema,
+    ) {
+        let mut cells = BTreeMap::new();
+        for (index, column) in schema.columns().iter().enumerate() {
+            let Some(cell) = row.cells[index].as_ref() else {
+                continue;
+            };
+            if !cell.raw_input.is_empty() {
+                cells.insert(column.name.clone(), cell.raw_input.clone());
+            }
+        }
+
+        let persisted = PersistedTabState {
+            version: 1,
+            mirrored_name: mirrored_name.to_string(),
+            cells,
+        };
+
+        let Some(session_key) = self.session_key() else {
+            self.debug_log(format!(
+                "skip_persist tab={} reason=no-session-key",
+                tab_position
+            ));
+            return;
+        };
+
+        let path = persisted_tab_state_path(session_key.as_str(), tab_position);
+
+        if let Err(error) = write_persisted_tab_state(
+            session_key.as_str(),
+            tab_position,
+            self.plugin_id.unwrap_or(0),
+            &persisted,
+        ) {
+            eprintln!(
+                "super-tabs: failed to persist tab state for position {tab_position}: {error}"
+            );
+        } else {
+            self.debug_log(format!(
+                "persist tab={} path={} mirrored_name={}",
+                tab_position,
+                path.display(),
+                mirrored_name
+            ));
         }
     }
 
@@ -340,15 +510,27 @@ impl State {
             return false;
         };
         let Ok(payload) = UpdatePayload::parse(payload) else {
+            self.debug_log("pipe ignored invalid payload");
             return false;
         };
-        let Some(&tab_position) = self.pane_to_tab_position.get(&payload.pane_id) else {
+        let resolved_tab_position = self.pane_to_tab_position.get(&payload.pane_id).copied();
+        self.debug_log(format!(
+            "pipe pane_id={} resolved_tab={resolved_tab_position:?} updates={:?}",
+            payload.pane_id, payload.updates
+        ));
+        let Some(tab_position) = resolved_tab_position else {
             return false;
         };
 
         let mut row = self
             .rows_by_tab_position
             .remove(&tab_position)
+            .or_else(|| {
+                self.tabs
+                    .iter()
+                    .find(|tab| tab.position == tab_position)
+                    .and_then(|tab| self.load_row_state_for_tab(tab, &schema))
+            })
             .unwrap_or_else(|| TabRowState::empty(&schema));
         let mut changed = false;
 
@@ -359,8 +541,6 @@ impl State {
 
             let column = &schema.columns()[index];
             let cell = CellState::from_raw(raw_value, &column.default_style);
-            let old_width = row.cells[index].as_ref().map(CellState::display_width);
-            self.width_indexes[index].replace(old_width, cell.display_width());
             row.cells[index] = Some(cell);
             changed = true;
         }
@@ -372,13 +552,41 @@ impl State {
 
         let mirrored_name = encode_tab_name(schema.columns(), &row.cells);
         row.last_mirrored_tab_name = Some(mirrored_name.clone());
-        self.rows_by_tab_position.insert(tab_position, row);
+        self.rows_by_tab_position.insert(tab_position, row.clone());
+
+        self.write_persisted_row(tab_position, &mirrored_name, &row, &schema);
+        self.debug_log(format!(
+            "rename target_tab={} mirrored_name={}",
+            tab_position, mirrored_name
+        ));
         self.rename_live_tab(tab_position, &mirrored_name);
+
+        self.recompute_width_indexes();
         true
     }
 
+    fn recompute_width_indexes(&mut self) {
+        let Some(schema) = self.schema.as_ref() else {
+            return;
+        };
+
+        let mut width_indexes = vec![WidthIndex::default(); schema.len()];
+        for row in self.rows_by_tab_position.values() {
+            add_row_widths_to_indexes(&mut width_indexes, row);
+        }
+        self.width_indexes = width_indexes;
+    }
+
+    fn session_key(&self) -> Option<String> {
+        self.mode_info
+            .session_name
+            .as_ref()
+            .map(|session_name| sanitize_session_key(session_name))
+            .filter(|session_name| !session_name.is_empty())
+    }
+
     fn rename_live_tab(&self, tab_position: usize, mirrored_name: &str) {
-        rename_tab(tab_position as u32, mirrored_name.to_string());
+        rename_tab((tab_position + 1) as u32, mirrored_name.to_string());
     }
 
     fn expand_overflow_format(&self, format: &str, count: usize) -> String {
@@ -626,6 +834,188 @@ impl State {
         }
 
         None
+    }
+}
+
+fn add_row_widths_to_indexes(width_indexes: &mut [WidthIndex], row: &TabRowState) {
+    for (index, cell) in row.cells.iter().enumerate() {
+        if let Some(cell) = cell {
+            width_indexes[index].replace(None, cell.display_width());
+        }
+    }
+}
+
+fn build_terminal_pane_lookup(pane_manifest: &PaneManifest) -> BTreeMap<u32, usize> {
+    let mut pane_to_tab_position = BTreeMap::new();
+
+    for (tab_position, panes) in &pane_manifest.panes {
+        for pane in panes {
+            if !pane.is_plugin {
+                pane_to_tab_position.insert(pane.id, *tab_position);
+            }
+        }
+    }
+
+    pane_to_tab_position
+}
+
+fn persisted_tab_state_path(session_key: &str, tab_position: usize) -> PathBuf {
+    PathBuf::from(STATE_DIR)
+        .join(session_key)
+        .join(format!("{STATE_FILE_PREFIX}{tab_position}.json"))
+}
+
+fn read_persisted_tab_state(session_key: &str, tab_position: usize) -> Option<PersistedTabState> {
+    let path = persisted_tab_state_path(session_key, tab_position);
+    let content = fs::read_to_string(path).ok()?;
+    serde_json::from_str(&content).ok()
+}
+
+fn write_persisted_tab_state(
+    session_key: &str,
+    tab_position: usize,
+    plugin_id: u32,
+    persisted: &PersistedTabState,
+) -> Result<(), String> {
+    let path = persisted_tab_state_path(session_key, tab_position);
+    let temp_path = path.with_extension(format!("json.tmp-{plugin_id}"));
+    let content = serde_json::to_vec(persisted)
+        .map_err(|error| format!("serialize persisted state: {error}"))?;
+
+    let parent_dir = path
+        .parent()
+        .ok_or_else(|| "missing persisted state parent directory".to_string())?;
+    fs::create_dir_all(parent_dir).map_err(|error| format!("create state dir: {error}"))?;
+
+    let mut file =
+        File::create(&temp_path).map_err(|error| format!("create temp file: {error}"))?;
+    file.write_all(&content)
+        .map_err(|error| format!("write temp file: {error}"))?;
+    file.sync_all()
+        .map_err(|error| format!("sync temp file: {error}"))?;
+    drop(file);
+
+    fs::rename(&temp_path, &path).map_err(|error| format!("rename temp file: {error}"))
+}
+
+fn sanitize_session_key(session_name: &str) -> String {
+    session_name
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.') {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+fn parse_bool_config(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes" | "on"
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pane_lookup_ignores_plugin_id_collisions() {
+        let pane_manifest = PaneManifest {
+            panes: std::collections::HashMap::from([
+                (
+                    0,
+                    vec![
+                        PaneInfo {
+                            id: 0,
+                            is_plugin: false,
+                            is_focused: false,
+                            is_fullscreen: false,
+                            is_floating: false,
+                            is_suppressed: false,
+                            title: "tab0-shell".to_string(),
+                            exited: false,
+                            exit_status: None,
+                            is_held: false,
+                            pane_x: 0,
+                            pane_content_x: 0,
+                            pane_y: 0,
+                            pane_content_y: 0,
+                            pane_rows: 0,
+                            pane_content_rows: 0,
+                            pane_columns: 0,
+                            pane_content_columns: 0,
+                            cursor_coordinates_in_pane: None,
+                            terminal_command: None,
+                            plugin_url: None,
+                            is_selectable: true,
+                            index_in_pane_group: BTreeMap::new(),
+                        },
+                        PaneInfo {
+                            id: 1,
+                            is_plugin: true,
+                            is_focused: false,
+                            is_fullscreen: false,
+                            is_floating: false,
+                            is_suppressed: false,
+                            title: "super-tabs".to_string(),
+                            exited: false,
+                            exit_status: None,
+                            is_held: false,
+                            pane_x: 0,
+                            pane_content_x: 0,
+                            pane_y: 0,
+                            pane_content_y: 0,
+                            pane_rows: 0,
+                            pane_content_rows: 0,
+                            pane_columns: 0,
+                            pane_content_columns: 0,
+                            cursor_coordinates_in_pane: None,
+                            terminal_command: None,
+                            plugin_url: Some("file:/plugin.wasm".to_string()),
+                            is_selectable: false,
+                            index_in_pane_group: BTreeMap::new(),
+                        },
+                    ],
+                ),
+                (
+                    1,
+                    vec![PaneInfo {
+                        id: 1,
+                        is_plugin: false,
+                        is_focused: false,
+                        is_fullscreen: false,
+                        is_floating: false,
+                        is_suppressed: false,
+                        title: "tab1-shell".to_string(),
+                        exited: false,
+                        exit_status: None,
+                        is_held: false,
+                        pane_x: 0,
+                        pane_content_x: 0,
+                        pane_y: 0,
+                        pane_content_y: 0,
+                        pane_rows: 0,
+                        pane_content_rows: 0,
+                        pane_columns: 0,
+                        pane_content_columns: 0,
+                        cursor_coordinates_in_pane: None,
+                        terminal_command: None,
+                        plugin_url: None,
+                        is_selectable: true,
+                        index_in_pane_group: BTreeMap::new(),
+                    }],
+                ),
+            ]),
+        };
+
+        let pane_to_tab_position = build_terminal_pane_lookup(&pane_manifest);
+
+        assert_eq!(pane_to_tab_position.get(&0), Some(&0));
+        assert_eq!(pane_to_tab_position.get(&1), Some(&1));
     }
 }
 

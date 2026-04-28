@@ -10,5 +10,7 @@ description = "A schema-driven vertical tab plugin for Zellij"
 license = "MIT"
 
 [dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 super-tabs-core = { path = "core" }
 zellij-tile = { git = "https://github.com/zellij-org/zellij", branch = "main" }
