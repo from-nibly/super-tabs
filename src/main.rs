@@ -7,8 +7,8 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 use super_tabs_core::{
     CellState, PIPE_NAME, Schema, StyledText, UpdatePayload, WidthIndex, apply_default_style,
-    clip_right_edge, decode_tab_name, encode_tab_name, fit_cell_to_width, parse_styled_string,
-    solve_column_widths,
+    SUPER_TAB_ID_KEY, clip_right_edge, decode_super_tab_id, decode_tab_name,
+    encode_tab_name_with_id, fit_cell_to_width, parse_styled_string, solve_column_widths,
 };
 use zellij_tile::prelude::*;
 
@@ -72,9 +72,11 @@ struct State {
     schema: Option<Schema>,
     plugin_id: Option<u32>,
     debug_enabled: bool,
-    rows_by_tab_position: BTreeMap<usize, TabRowState>,
+    rows_by_tab_id: BTreeMap<String, TabRowState>,
+    tab_id_by_position: BTreeMap<usize, String>,
     pane_to_tab_position: BTreeMap<u32, usize>,
     width_indexes: Vec<WidthIndex>,
+    next_tab_id: u64,
     last_rows: usize,
     permissions_granted: bool,
     is_selectable: bool,
@@ -335,46 +337,172 @@ impl State {
         self.pane_to_tab_position = build_terminal_pane_lookup(&self.pane_manifest);
     }
 
+    fn observe_tab_id(&mut self, tab_id: &str) {
+        let Some(tab_id_number) = tab_id
+            .strip_prefix("st-")
+            .and_then(|tab_id_number| tab_id_number.parse::<u64>().ok())
+        else {
+            return;
+        };
+
+        self.next_tab_id = self.next_tab_id.max(tab_id_number.saturating_add(1));
+    }
+
+    fn mint_super_tab_id(&mut self) -> String {
+        loop {
+            let next_tab_id = self.next_tab_id.max(1);
+            self.next_tab_id = next_tab_id.saturating_add(1);
+
+            let candidate = format!("st-{next_tab_id}");
+            let candidate_in_live_tabs = self
+                .tabs
+                .iter()
+                .filter_map(|tab| decode_super_tab_id(&tab.name))
+                .any(|tab_id| tab_id == candidate);
+            let candidate_in_rows = self.rows_by_tab_id.contains_key(&candidate);
+            let candidate_in_positions = self
+                .tab_id_by_position
+                .values()
+                .any(|tab_id| tab_id == &candidate);
+
+            if !candidate_in_live_tabs && !candidate_in_rows && !candidate_in_positions {
+                return candidate;
+            }
+        }
+    }
+
     fn reconcile_rows_with_tabs(&mut self) -> bool {
         let Some(schema) = self.schema.clone() else {
             return false;
         };
 
+        let tabs = self.tabs.clone();
         let mut next_rows = BTreeMap::new();
+        let mut next_tab_ids = BTreeMap::new();
         let mut next_width_indexes = vec![WidthIndex::default(); schema.len()];
 
-        for tab in &self.tabs {
-            let Some(row) = self.load_row_state_for_tab(tab, &schema) else {
+        for tab in &tabs {
+            let Some((tab_id, row)) = self.load_row_state_for_tab(tab, &schema) else {
                 continue;
             };
+
+            next_tab_ids.insert(tab.position, tab_id.clone());
             add_row_widths_to_indexes(&mut next_width_indexes, &row);
-            next_rows.insert(tab.position, row);
+            next_rows.insert(tab_id, row);
         }
 
-        let changed =
-            self.rows_by_tab_position != next_rows || self.width_indexes != next_width_indexes;
-        self.rows_by_tab_position = next_rows;
+        let changed = self.rows_by_tab_id != next_rows
+            || self.tab_id_by_position != next_tab_ids
+            || self.width_indexes != next_width_indexes;
+        self.rows_by_tab_id = next_rows;
+        self.tab_id_by_position = next_tab_ids;
         self.width_indexes = next_width_indexes;
         changed
     }
 
-    fn load_row_state_for_tab(&self, tab: &TabInfo, schema: &Schema) -> Option<TabRowState> {
-        if let Some(row) = self.read_persisted_row(tab.position, tab, schema) {
-            self.debug_log(format!(
-                "hydrate tab={} source=cache name={}",
-                tab.position, tab.name
-            ));
-            return Some(row);
+    fn load_row_state_for_tab(
+        &mut self,
+        tab: &TabInfo,
+        schema: &Schema,
+    ) -> Option<(String, TabRowState)> {
+        if let Some(tab_id) = self
+            .tab_id_by_position
+            .get(&tab.position)
+            .cloned()
+            .or_else(|| decode_super_tab_id(&tab.name))
+        {
+            self.observe_tab_id(&tab_id);
+
+            if let Some(row) = self.read_persisted_row(&tab_id, tab, schema) {
+                self.debug_log(format!(
+                    "hydrate tab={} id={} source=cache name={}",
+                    tab.position, tab_id, tab.name
+                ));
+                return Some((tab_id, row));
+            }
+
+            let row = self.build_row_state_from_tab_name(tab, schema);
+            if row.is_some() {
+                self.debug_log(format!(
+                    "hydrate tab={} id={} source=tab-name name={}",
+                    tab.position, tab_id, tab.name
+                ));
+            }
+            return row.map(|row| (tab_id, row));
         }
 
-        let row = self.build_row_state_from_tab_name(tab, schema);
-        if row.is_some() {
-            self.debug_log(format!(
-                "hydrate tab={} source=tab-name name={}",
-                tab.position, tab.name
-            ));
+        let mut row = self.read_legacy_persisted_row(tab.position, tab, schema)?;
+        let tab_id = self.mint_super_tab_id();
+        let mirrored_name = encode_tab_name_with_id(schema.columns(), &row.cells, Some(&tab_id));
+        row.last_mirrored_tab_name = Some(mirrored_name.clone());
+        self.write_persisted_row(&tab_id, tab.position, &mirrored_name, &row, schema);
+        self.debug_log(format!(
+            "migrate tab={} id={} mirrored_name={}",
+            tab.position, tab_id, mirrored_name
+        ));
+        self.rename_live_tab(tab.position, &mirrored_name);
+        Some((tab_id, row))
+    }
+
+    fn read_legacy_persisted_row(
+        &self,
+        tab_position: usize,
+        tab: &TabInfo,
+        schema: &Schema,
+    ) -> Option<TabRowState> {
+        self.read_persisted_row_by_key(&tab_position.to_string(), tab_position, tab, schema)
+            .or_else(|| self.build_row_state_from_tab_name(tab, schema))
+    }
+
+    fn load_cached_row_for_identity(
+        &mut self,
+        tab: &TabInfo,
+        tab_id: &str,
+    ) -> Option<TabRowState> {
+        let cached_row = self.rows_by_tab_id.remove(tab_id)?;
+
+        if cached_row.last_mirrored_tab_name.as_deref() == Some(tab.name.as_str()) {
+            return Some(cached_row);
         }
-        row
+
+        let live_tab_id = decode_super_tab_id(&tab.name);
+        if self.tab_id_by_position.get(&tab.position).map(String::as_str) == Some(tab_id)
+            && live_tab_id.as_deref() != Some(tab_id)
+        {
+            return Some(cached_row);
+        }
+
+        None
+    }
+
+    fn tab_id_for_position(&self, tab_position: usize) -> Option<String> {
+        self.tab_id_by_position.get(&tab_position).cloned().or_else(|| {
+            self.tabs
+                .iter()
+                .find(|tab| tab.position == tab_position)
+                .and_then(|tab| decode_super_tab_id(&tab.name))
+        })
+    }
+
+    fn managed_tab_fallback_name(&self, tab: &TabInfo) -> Option<String> {
+        let trimmed_name = tab.name.trim();
+        if trimmed_name.is_empty() || trimmed_name.starts_with("Tab #") {
+            return None;
+        }
+
+        let Some(parsed_name) = decode_tab_name(&tab.name) else {
+            return Some(tab.name.clone());
+        };
+        let has_super_tab_id = parsed_name.contains_key(SUPER_TAB_ID_KEY);
+        let has_other_values = parsed_name
+            .iter()
+            .any(|(key, value)| key != SUPER_TAB_ID_KEY && !value.is_empty());
+
+        if has_super_tab_id && !has_other_values {
+            return None;
+        }
+
+        Some(tab.name.clone())
     }
 
     fn build_row_state_from_tab_name(&self, tab: &TabInfo, schema: &Schema) -> Option<TabRowState> {
@@ -405,17 +533,28 @@ impl State {
 
     fn read_persisted_row(
         &self,
+        tab_id: &str,
+        tab: &TabInfo,
+        schema: &Schema,
+    ) -> Option<TabRowState> {
+        self.read_persisted_row_by_key(tab_id, tab.position, tab, schema)
+    }
+
+    fn read_persisted_row_by_key(
+        &self,
+        tab_key: &str,
         tab_position: usize,
         tab: &TabInfo,
         schema: &Schema,
     ) -> Option<TabRowState> {
         let session_key = self.session_key()?;
-        let path = persisted_tab_state_path(session_key.as_str(), tab_position);
-        let persisted = read_persisted_tab_state(session_key.as_str(), tab_position)?;
+        let path = persisted_tab_state_path(session_key.as_str(), tab_key);
+        let persisted = read_persisted_tab_state(session_key.as_str(), tab_key)?;
         if persisted.version != 1 || persisted.mirrored_name != tab.name {
             self.debug_log(format!(
-                "cache_miss tab={} path={} mirrored_name={} live_name={}",
+                "cache_miss tab={} key={} path={} mirrored_name={} live_name={}",
                 tab_position,
+                tab_key,
                 path.display(),
                 persisted.mirrored_name,
                 tab.name
@@ -452,6 +591,7 @@ impl State {
 
     fn write_persisted_row(
         &self,
+        tab_id: &str,
         tab_position: usize,
         mirrored_name: &str,
         row: &TabRowState,
@@ -475,27 +615,28 @@ impl State {
 
         let Some(session_key) = self.session_key() else {
             self.debug_log(format!(
-                "skip_persist tab={} reason=no-session-key",
-                tab_position
+                "skip_persist tab={} id={} reason=no-session-key",
+                tab_position, tab_id
             ));
             return;
         };
 
-        let path = persisted_tab_state_path(session_key.as_str(), tab_position);
+        let path = persisted_tab_state_path(session_key.as_str(), tab_id);
 
         if let Err(error) = write_persisted_tab_state(
             session_key.as_str(),
-            tab_position,
+            tab_id,
             self.plugin_id.unwrap_or(0),
             &persisted,
         ) {
             eprintln!(
-                "super-tabs: failed to persist tab state for position {tab_position}: {error}"
+                "super-tabs: failed to persist tab state for position {tab_position} ({tab_id}): {error}"
             );
         } else {
             self.debug_log(format!(
-                "persist tab={} path={} mirrored_name={}",
+                "persist tab={} id={} path={} mirrored_name={}",
                 tab_position,
+                tab_id,
                 path.display(),
                 mirrored_name
             ));
@@ -514,55 +655,75 @@ impl State {
             return false;
         };
         let resolved_tab_position = self.pane_to_tab_position.get(&payload.pane_id).copied();
-        self.debug_log(format!(
-            "pipe pane_id={} resolved_tab={resolved_tab_position:?} updates={:?}",
-            payload.pane_id, payload.updates
-        ));
         let Some(tab_position) = resolved_tab_position else {
             return false;
         };
+        let Some(tab) = self.tabs.iter().find(|tab| tab.position == tab_position).cloned() else {
+            return false;
+        };
+        let resolved_tab_id = self.tab_id_for_position(tab_position);
+        let had_stable_tab_id = resolved_tab_id.is_some();
+        let tab_id = match resolved_tab_id {
+            Some(tab_id) => {
+                self.observe_tab_id(&tab_id);
+                tab_id
+            }
+            None => self.mint_super_tab_id(),
+        };
+        self.debug_log(format!(
+            "pipe pane_id={} resolved_tab={resolved_tab_position:?} tab_id={} updates={:?}",
+            payload.pane_id, tab_id, payload.updates
+        ));
 
-        let mut row = self
-            .rows_by_tab_position
-            .remove(&tab_position)
-            .or_else(|| {
-                self.tabs
-                    .iter()
-                    .find(|tab| tab.position == tab_position)
-                    .and_then(|tab| self.load_row_state_for_tab(tab, &schema))
-            })
-            .unwrap_or_else(|| TabRowState::empty(&schema));
-        let mut changed = false;
+        let mut row = self.row_state_for_update(&tab, &tab_id, &schema, !had_stable_tab_id);
+        let changed = apply_updates_to_row(&mut row, &schema, payload.updates);
+        let mirrored_name =
+            encode_tab_name_with_id(schema.columns(), &row.cells, Some(tab_id.as_str()));
 
-        for (column_name, raw_value) in payload.updates {
-            let Some(index) = schema.index_of(&column_name) else {
-                continue;
-            };
-
-            let column = &schema.columns()[index];
-            let cell = CellState::from_raw(raw_value, &column.default_style);
-            row.cells[index] = Some(cell);
-            changed = true;
-        }
-
-        if !changed {
-            self.rows_by_tab_position.insert(tab_position, row);
+        if !changed && row.last_mirrored_tab_name.as_deref() == Some(mirrored_name.as_str()) {
+            self.rows_by_tab_id.insert(tab_id.clone(), row);
+            self.tab_id_by_position.insert(tab_position, tab_id);
             return false;
         }
 
-        let mirrored_name = encode_tab_name(schema.columns(), &row.cells);
         row.last_mirrored_tab_name = Some(mirrored_name.clone());
-        self.rows_by_tab_position.insert(tab_position, row.clone());
+        self.rows_by_tab_id.insert(tab_id.clone(), row.clone());
+        self.tab_id_by_position.insert(tab_position, tab_id.clone());
 
-        self.write_persisted_row(tab_position, &mirrored_name, &row, &schema);
+        self.write_persisted_row(&tab_id, tab_position, &mirrored_name, &row, &schema);
         self.debug_log(format!(
-            "rename target_tab={} mirrored_name={}",
-            tab_position, mirrored_name
+            "rename target_tab={} id={} mirrored_name={}",
+            tab_position, tab_id, mirrored_name
         ));
         self.rename_live_tab(tab_position, &mirrored_name);
 
         self.recompute_width_indexes();
         true
+    }
+
+    fn row_state_for_update(
+        &mut self,
+        tab: &TabInfo,
+        tab_id: &str,
+        schema: &Schema,
+        allow_legacy_position_fallback: bool,
+    ) -> TabRowState {
+        if let Some(row) = self.load_cached_row_for_identity(tab, tab_id) {
+            return row;
+        }
+
+        if let Some(row) = self.read_persisted_row(tab_id, tab, schema) {
+            return row;
+        }
+
+        if allow_legacy_position_fallback
+            && let Some(row) = self.read_legacy_persisted_row(tab.position, tab, schema)
+        {
+            return row;
+        }
+
+        self.build_row_state_from_tab_name(tab, schema)
+            .unwrap_or_else(|| TabRowState::empty(schema))
     }
 
     fn recompute_width_indexes(&mut self) {
@@ -571,7 +732,7 @@ impl State {
         };
 
         let mut width_indexes = vec![WidthIndex::default(); schema.len()];
-        for row in self.rows_by_tab_position.values() {
+        for row in self.rows_by_tab_id.values() {
             add_row_widths_to_indexes(&mut width_indexes, row);
         }
         self.width_indexes = width_indexes;
@@ -619,7 +780,10 @@ impl State {
         let Some(schema) = self.schema.as_ref() else {
             return StyledText::plain(tab.name.clone());
         };
-        let Some(row) = self.rows_by_tab_position.get(&tab.position) else {
+        let Some(tab_id) = self.tab_id_for_position(tab.position) else {
+            return self.render_unmanaged_row(tab);
+        };
+        let Some(row) = self.rows_by_tab_id.get(&tab_id) else {
             return self.render_unmanaged_row(tab);
         };
 
@@ -665,12 +829,10 @@ impl State {
     }
 
     fn render_unmanaged_row(&self, tab: &TabInfo) -> StyledText {
-        let fallback_name = if !tab.name.trim().is_empty() && !tab.name.starts_with("Tab #") {
-            tab.name.clone()
-        } else {
+        let fallback_name = self.managed_tab_fallback_name(tab).unwrap_or_else(|| {
             self.get_focused_pane_title(tab.position)
                 .unwrap_or_else(|| format!("Tab {}", tab.position))
-        };
+        });
 
         let mut content = StyledText::plain(fallback_name);
         let indicators = self.build_indicator_text(tab);
@@ -859,25 +1021,25 @@ fn build_terminal_pane_lookup(pane_manifest: &PaneManifest) -> BTreeMap<u32, usi
     pane_to_tab_position
 }
 
-fn persisted_tab_state_path(session_key: &str, tab_position: usize) -> PathBuf {
+fn persisted_tab_state_path(session_key: &str, tab_key: &str) -> PathBuf {
     PathBuf::from(STATE_DIR)
         .join(session_key)
-        .join(format!("{STATE_FILE_PREFIX}{tab_position}.json"))
+        .join(format!("{STATE_FILE_PREFIX}{tab_key}.json"))
 }
 
-fn read_persisted_tab_state(session_key: &str, tab_position: usize) -> Option<PersistedTabState> {
-    let path = persisted_tab_state_path(session_key, tab_position);
+fn read_persisted_tab_state(session_key: &str, tab_key: &str) -> Option<PersistedTabState> {
+    let path = persisted_tab_state_path(session_key, tab_key);
     let content = fs::read_to_string(path).ok()?;
     serde_json::from_str(&content).ok()
 }
 
 fn write_persisted_tab_state(
     session_key: &str,
-    tab_position: usize,
+    tab_key: &str,
     plugin_id: u32,
     persisted: &PersistedTabState,
 ) -> Result<(), String> {
-    let path = persisted_tab_state_path(session_key, tab_position);
+    let path = persisted_tab_state_path(session_key, tab_key);
     let temp_path = path.with_extension(format!("json.tmp-{plugin_id}"));
     let content = serde_json::to_vec(persisted)
         .map_err(|error| format!("serialize persisted state: {error}"))?;
@@ -896,6 +1058,34 @@ fn write_persisted_tab_state(
     drop(file);
 
     fs::rename(&temp_path, &path).map_err(|error| format!("rename temp file: {error}"))
+}
+
+fn apply_updates_to_row(
+    row: &mut TabRowState,
+    schema: &Schema,
+    updates: BTreeMap<String, String>,
+) -> bool {
+    let mut changed = false;
+
+    for (column_name, raw_value) in updates {
+        let Some(index) = schema.index_of(&column_name) else {
+            continue;
+        };
+
+        let current_value = row.cells[index]
+            .as_ref()
+            .map(|cell| cell.raw_input.as_str())
+            .unwrap_or("");
+        if current_value == raw_value {
+            continue;
+        }
+
+        let column = &schema.columns()[index];
+        row.cells[index] = Some(CellState::from_raw(raw_value, &column.default_style));
+        changed = true;
+    }
+
+    changed
 }
 
 fn sanitize_session_key(session_name: &str) -> String {
@@ -921,6 +1111,17 @@ fn parse_bool_config(value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_schema(columns: &str) -> Schema {
+        let mut config = BTreeMap::new();
+        config.insert("columns".to_string(), columns.to_string());
+
+        for column in columns.split(',') {
+            config.insert(format!("column_{column}"), "resize=resize".to_string());
+        }
+
+        Schema::from_config(&config).unwrap()
+    }
 
     #[test]
     fn pane_lookup_ignores_plugin_id_collisions() {
@@ -1016,6 +1217,97 @@ mod tests {
 
         assert_eq!(pane_to_tab_position.get(&0), Some(&0));
         assert_eq!(pane_to_tab_position.get(&1), Some(&1));
+    }
+
+    #[test]
+    fn apply_updates_to_row_skips_unchanged_values() {
+        let schema = test_schema("branch,status");
+
+        let mut row = TabRowState::empty(&schema);
+        row.cells[0] = Some(CellState::from_raw(
+            "main",
+            &schema.columns()[0].default_style,
+        ));
+        row.cells[1] = Some(CellState::from_raw(
+            "dirty",
+            &schema.columns()[1].default_style,
+        ));
+
+        let changed = apply_updates_to_row(
+            &mut row,
+            &schema,
+            BTreeMap::from([
+                ("branch".to_string(), "main".to_string()),
+                ("status".to_string(), "dirty".to_string()),
+            ]),
+        );
+
+        assert!(!changed);
+        assert_eq!(row.cells[0].as_ref().unwrap().raw_input, "main");
+        assert_eq!(row.cells[1].as_ref().unwrap().raw_input, "dirty");
+    }
+
+    #[test]
+    fn row_state_for_update_discards_stale_cached_row_when_tab_name_changed() {
+        let schema = test_schema("status");
+        let stale_tab = TabInfo {
+            position: 14,
+            name: "__super_tabs_id=\"st-14\" | status=\"IDLE\"".to_string(),
+            ..Default::default()
+        };
+        let live_tab = TabInfo {
+            position: 14,
+            name: "__super_tabs_id=\"st-14\" | status=\"ACTIVE\"".to_string(),
+            ..Default::default()
+        };
+
+        let mut state = State {
+            tabs: vec![live_tab.clone()],
+            ..Default::default()
+        };
+
+        state.rows_by_tab_id.insert(
+            "st-14".to_string(),
+            state
+                .build_row_state_from_tab_name(&stale_tab, &schema)
+                .expect("stale tab name should decode"),
+        );
+
+        let row = state.row_state_for_update(&live_tab, "st-14", &schema, false);
+
+        assert_eq!(row.cells[0].as_ref().unwrap().raw_input, "ACTIVE");
+    }
+
+    #[test]
+    fn row_state_for_update_keeps_cached_row_while_tab_rename_event_is_pending() {
+        let schema = test_schema("status");
+        let legacy_tab = TabInfo {
+            position: 2,
+            name: "status=\"IDLE\"".to_string(),
+            ..Default::default()
+        };
+        let cached_tab = TabInfo {
+            position: 2,
+            name: "__super_tabs_id=\"st-2\" | status=\"RUNNING\"".to_string(),
+            ..Default::default()
+        };
+
+        let mut state = State {
+            tabs: vec![legacy_tab.clone()],
+            tab_id_by_position: BTreeMap::from([(2, "st-2".to_string())]),
+            ..Default::default()
+        };
+
+        state.rows_by_tab_id.insert(
+            "st-2".to_string(),
+            state
+                .build_row_state_from_tab_name(&cached_tab, &schema)
+                .expect("cached tab name should decode"),
+        );
+
+        let row = state.row_state_for_update(&legacy_tab, "st-2", &schema, false);
+
+        assert_eq!(row.cells[0].as_ref().unwrap().raw_input, "RUNNING");
     }
 }
 

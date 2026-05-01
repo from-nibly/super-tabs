@@ -14,4 +14,7 @@ pub use style::{
     CellState, ColorSpec, InlineStyle, StyledSegment, StyledText, apply_default_style,
     has_style_directive, parse_style_directive, parse_style_literal, parse_styled_string,
 };
-pub use tab_name::{decode_tab_name, encode_tab_name};
+pub use tab_name::{
+    SUPER_TAB_ID_KEY, decode_super_tab_id, decode_tab_name, encode_tab_name,
+    encode_tab_name_with_id,
+};

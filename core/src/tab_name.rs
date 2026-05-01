@@ -3,8 +3,22 @@ use std::collections::BTreeMap;
 use crate::schema::ColumnSpec;
 use crate::style::CellState;
 
+pub const SUPER_TAB_ID_KEY: &str = "__super_tabs_id";
+
 pub fn encode_tab_name(columns: &[ColumnSpec], cells: &[Option<CellState>]) -> String {
+    encode_tab_name_with_id(columns, cells, None)
+}
+
+pub fn encode_tab_name_with_id(
+    columns: &[ColumnSpec],
+    cells: &[Option<CellState>],
+    super_tab_id: Option<&str>,
+) -> String {
     let mut parts = Vec::new();
+
+    if let Some(super_tab_id) = super_tab_id.filter(|super_tab_id| !super_tab_id.is_empty()) {
+        push_encoded_part(&mut parts, SUPER_TAB_ID_KEY, super_tab_id);
+    }
 
     for (index, column) in columns.iter().enumerate() {
         let value = cells
@@ -17,14 +31,18 @@ pub fn encode_tab_name(columns: &[ColumnSpec], cells: &[Option<CellState>]) -> S
             continue;
         }
 
-        parts.push(format!(
-            "{}=\"{}\"",
-            column.name,
-            value.replace('\\', "\\\\").replace('"', "\\\"")
-        ));
+        push_encoded_part(&mut parts, &column.name, value);
     }
 
     parts.join(" | ")
+}
+
+fn push_encoded_part(parts: &mut Vec<String>, key: &str, value: &str) {
+    parts.push(format!(
+        "{}=\"{}\"",
+        key,
+        value.replace('\\', "\\\\").replace('"', "\\\"")
+    ));
 }
 
 pub fn decode_tab_name(input: &str) -> Option<BTreeMap<String, String>> {
@@ -53,6 +71,13 @@ pub fn decode_tab_name(input: &str) -> Option<BTreeMap<String, String>> {
 
         rest = remaining.strip_prefix('|')?.trim_start();
     }
+}
+
+pub fn decode_super_tab_id(input: &str) -> Option<String> {
+    decode_tab_name(input)?
+        .get(SUPER_TAB_ID_KEY)
+        .filter(|super_tab_id| !super_tab_id.is_empty())
+        .cloned()
 }
 
 fn parse_quoted_value(input: &str) -> Option<(String, &str)> {
@@ -126,5 +151,25 @@ mod tests {
         let decoded = decode_tab_name("branch=\"main\"").unwrap();
         assert_eq!(decoded.get("branch").unwrap(), "main");
         assert!(!decoded.contains_key("status"));
+    }
+
+    #[test]
+    fn round_trips_super_tab_id() {
+        let columns = vec![ColumnSpec {
+            name: "branch".to_string(),
+            resize_spec: ResizeSpec::Resize,
+            default_style: InlineStyle::default(),
+        }];
+        let cells = vec![Some(CellState::from_plain_text(
+            "main",
+            &InlineStyle::default(),
+        ))];
+
+        let encoded = encode_tab_name_with_id(&columns, &cells, Some("st-12"));
+        let decoded = decode_tab_name(&encoded).unwrap();
+
+        assert_eq!(decode_super_tab_id(&encoded).as_deref(), Some("st-12"));
+        assert_eq!(decoded.get(SUPER_TAB_ID_KEY).unwrap(), "st-12");
+        assert_eq!(decoded.get("branch").unwrap(), "main");
     }
 }
