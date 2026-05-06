@@ -1,6 +1,6 @@
 use std::cmp::{max, min};
 use std::collections::BTreeMap;
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File};
 use std::io::{ErrorKind, Write};
 use std::path::PathBuf;
 
@@ -13,7 +13,7 @@ use super_tabs_core::{
 use zellij_tile::prelude::*;
 
 #[cfg(not(test))]
-const STATE_DIR: &str = "/data/super-tabs";
+const STATE_DIR: &str = "/host/super-tabs";
 const STATE_FILE_PREFIX: &str = "tab-";
 const PENDING_FILE_PREFIX: &str = "pending-";
 
@@ -80,6 +80,9 @@ struct State {
     render: RenderConfig,
     schema: Option<Schema>,
     plugin_id: Option<u32>,
+    shared_state_host_folder: Option<PathBuf>,
+    shared_state_mount_requested: bool,
+    shared_state_ready: bool,
     debug_enabled: bool,
     rows_by_tab_id: BTreeMap<String, TabRowState>,
     pending_tab_id_by_position: BTreeMap<usize, String>,
@@ -127,6 +130,16 @@ impl ZellijPlugin for State {
         } else if let Some(value) = configuration.get("border_char") {
             self.render.border = value.clone();
         }
+        match resolve_shared_state_host_folder(
+            configuration.get("state_host_folder").map(String::as_str),
+        ) {
+            Ok(host_folder) => {
+                self.shared_state_host_folder = Some(host_folder);
+            }
+            Err(error) => {
+                self.load_error = Some(format!("super-tabs config error: {error}"));
+            }
+        }
 
         match Schema::from_config(&configuration) {
             Ok(schema) => {
@@ -150,6 +163,7 @@ impl ZellijPlugin for State {
         request_permission(&[
             PermissionType::ReadApplicationState,
             PermissionType::ChangeApplicationState,
+            PermissionType::FullHdAccess,
         ]);
 
         subscribe(&[
@@ -159,6 +173,8 @@ impl ZellijPlugin for State {
             EventType::Mouse,
             EventType::PermissionRequestResult,
             EventType::Visible,
+            EventType::HostFolderChanged,
+            EventType::FailedToChangeHostFolder,
         ]);
     }
 
@@ -171,6 +187,7 @@ impl ZellijPlugin for State {
                 self.permissions_granted = true;
                 self.is_selectable = false;
                 set_selectable(false);
+                self.request_shared_state_mount();
 
                 while !self.pending_events.is_empty() {
                     let cached_event = self.pending_events.remove(0);
@@ -227,6 +244,33 @@ impl ZellijPlugin for State {
                 self.debug_log(format!(
                     "pane_update lookup={:?}",
                     self.pane_to_tab_position
+                ));
+                should_render = true;
+            }
+            Event::HostFolderChanged(host_folder) => {
+                self.shared_state_mount_requested = false;
+                if self.shared_state_host_folder.as_ref() == Some(&host_folder) {
+                    self.shared_state_ready = true;
+                    self.debug_log(format!(
+                        "shared_state_ready host_folder={}",
+                        host_folder.display()
+                    ));
+                    if self.reconcile_rows_with_tabs() {
+                        should_render = true;
+                    }
+                } else {
+                    self.debug_log(format!(
+                        "host_folder_changed ignored host_folder={}",
+                        host_folder.display()
+                    ));
+                }
+            }
+            Event::FailedToChangeHostFolder(error) => {
+                self.shared_state_mount_requested = false;
+                self.shared_state_ready = false;
+                let message = error.unwrap_or_else(|| "unknown error".to_string());
+                self.load_error = Some(format!(
+                    "super-tabs failed to mount shared state folder: {message}"
                 ));
                 should_render = true;
             }
@@ -409,6 +453,7 @@ impl State {
                 if allow_session_writes {
                     let duplicate_tab_id = tab_id;
                     tab_id = self.ensure_pending_tab_id_for_tab(tab);
+                    row = TabRowState::empty(&schema);
                     let mirrored_name =
                         self.mirror_tab_row(tab.position, &tab_id, &mut row, &schema);
                     self.debug_log(format!(
@@ -440,7 +485,7 @@ impl State {
             .collect::<Vec<_>>();
         for pending_position in stale_pending_positions {
             if !tabs.iter().any(|tab| tab.position == pending_position) {
-                self.clear_pending_tab_claim(pending_position);
+                self.pending_tab_id_by_position.remove(&pending_position);
             }
         }
 
@@ -484,7 +529,7 @@ impl State {
         if let Some(tab_id) = self.live_tab_id_for_tab(tab) {
             self.observe_tab_id(&tab_id);
             if allow_session_writes {
-                self.clear_pending_tab_claim(tab.position);
+                self.clear_pending_tab_claim_for_tab(tab);
             }
 
             if let Some(row) = self.read_persisted_row(&tab_id, tab, schema) {
@@ -563,21 +608,49 @@ impl State {
         mirrored_name
     }
 
-    fn clear_pending_tab_claim(&mut self, tab_position: usize) {
-        self.pending_tab_id_by_position.remove(&tab_position);
+    fn clear_pending_tab_claim_for_tab(&mut self, tab: &TabInfo) {
+        self.pending_tab_id_by_position.remove(&tab.position);
 
         let Some(session_key) = self.session_key() else {
             return;
         };
 
-        let path = pending_tab_claim_path(session_key.as_str(), tab_position);
+        let pending_claim_key = self.pending_tab_claim_key_for_tab(tab);
+        let path = pending_tab_claim_path(session_key.as_str(), &pending_claim_key);
         if let Err(error) = fs::remove_file(&path)
             && error.kind() != ErrorKind::NotFound
         {
             eprintln!(
-                "super-tabs: failed to clear pending tab claim for position {tab_position}: {error}"
+                "super-tabs: failed to clear pending tab claim for position {}: {error}",
+                tab.position
             );
         }
+    }
+
+    fn pending_tab_claim_key_for_tab(&self, tab: &TabInfo) -> String {
+        let mut terminal_pane_ids = self
+            .pane_manifest
+            .panes
+            .get(&tab.position)
+            .into_iter()
+            .flatten()
+            .filter(|pane| !pane.is_plugin)
+            .map(|pane| pane.id)
+            .collect::<Vec<_>>();
+        terminal_pane_ids.sort_unstable();
+
+        if terminal_pane_ids.is_empty() {
+            return format!("position-{}", tab.position);
+        }
+
+        format!(
+            "panes-{}",
+            terminal_pane_ids
+                .iter()
+                .map(u32::to_string)
+                .collect::<Vec<_>>()
+                .join("_")
+        )
     }
 
     fn refresh_pending_tab_id_for_tab(&mut self, tab: &TabInfo) -> Option<String> {
@@ -585,7 +658,8 @@ impl State {
             self.pending_tab_id_by_position.remove(&tab.position);
             return None;
         };
-        let Some(claim) = read_pending_tab_claim(session_key.as_str(), tab.position) else {
+        let pending_claim_key = self.pending_tab_claim_key_for_tab(tab);
+        let Some(claim) = read_pending_tab_claim(session_key.as_str(), &pending_claim_key) else {
             self.pending_tab_id_by_position.remove(&tab.position);
             return None;
         };
@@ -596,7 +670,7 @@ impl State {
             return Some(claim.tab_id);
         }
 
-        self.clear_pending_tab_claim(tab.position);
+        self.clear_pending_tab_claim_for_tab(tab);
         None
     }
 
@@ -622,7 +696,7 @@ impl State {
 
             match create_pending_tab_claim(
                 session_key.as_str(),
-                tab.position,
+                &self.pending_tab_claim_key_for_tab(tab),
                 self.plugin_id.unwrap_or(0),
                 &claim,
             ) {
@@ -891,7 +965,7 @@ impl State {
             if allow_session_writes && rename_pending {
                 self.pending_tab_id_by_position.insert(tab_position, tab_id);
             } else if allow_session_writes {
-                self.clear_pending_tab_claim(tab_position);
+                self.clear_pending_tab_claim_for_tab(&tab);
             }
             return false;
         }
@@ -901,7 +975,7 @@ impl State {
             self.pending_tab_id_by_position
                 .insert(tab_position, tab_id.clone());
         } else if allow_session_writes {
-            self.clear_pending_tab_claim(tab_position);
+            self.clear_pending_tab_claim_for_tab(&tab);
         }
 
         if !allow_session_writes {
@@ -963,7 +1037,32 @@ impl State {
         self.width_indexes = width_indexes;
     }
 
+    fn request_shared_state_mount(&mut self) {
+        if self.shared_state_ready || self.shared_state_mount_requested {
+            return;
+        }
+
+        let Some(host_folder) = self.shared_state_host_folder.clone() else {
+            self.load_error = Some(
+                "super-tabs: no shared state folder configured and HOME/XDG_DATA_HOME unavailable"
+                    .to_string(),
+            );
+            return;
+        };
+
+        self.shared_state_mount_requested = true;
+        self.debug_log(format!(
+            "mount_shared_state host_folder={}",
+            host_folder.display()
+        ));
+        change_host_folder(host_folder);
+    }
+
     fn session_key(&self) -> Option<String> {
+        if !self.shared_state_ready {
+            return None;
+        }
+
         self.mode_info
             .session_name
             .as_ref()
@@ -974,6 +1073,10 @@ impl State {
     // Every plugin instance in the session observes the same pane manifest, so
     // elect a single writer deterministically from the shared plugin_url + id.
     fn is_session_write_leader(&self) -> bool {
+        if !self.shared_state_ready {
+            return false;
+        }
+
         let Some(plugin_id) = self.plugin_id else {
             return true;
         };
@@ -1292,10 +1395,10 @@ fn persisted_tab_state_path(session_key: &str, tab_key: &str) -> PathBuf {
         .join(format!("{STATE_FILE_PREFIX}{tab_key}.json"))
 }
 
-fn pending_tab_claim_path(session_key: &str, tab_position: usize) -> PathBuf {
+fn pending_tab_claim_path(session_key: &str, pending_claim_key: &str) -> PathBuf {
     state_dir()
         .join(session_key)
-        .join(format!("{PENDING_FILE_PREFIX}{tab_position}.json"))
+        .join(format!("{PENDING_FILE_PREFIX}{pending_claim_key}.json"))
 }
 
 fn read_persisted_tab_state(session_key: &str, tab_key: &str) -> Option<PersistedTabState> {
@@ -1304,8 +1407,8 @@ fn read_persisted_tab_state(session_key: &str, tab_key: &str) -> Option<Persiste
     serde_json::from_str(&content).ok()
 }
 
-fn read_pending_tab_claim(session_key: &str, tab_position: usize) -> Option<PendingTabClaim> {
-    let path = pending_tab_claim_path(session_key, tab_position);
+fn read_pending_tab_claim(session_key: &str, pending_claim_key: &str) -> Option<PendingTabClaim> {
+    let path = pending_tab_claim_path(session_key, pending_claim_key);
     let content = fs::read_to_string(path).ok()?;
     serde_json::from_str(&content).ok()
 }
@@ -1334,16 +1437,19 @@ fn write_persisted_tab_state(
         .map_err(|error| format!("sync temp file: {error}"))?;
     drop(file);
 
-    fs::rename(&temp_path, &path).map_err(|error| format!("rename temp file: {error}"))
+    fs::rename(&temp_path, &path).map_err(|error| format!("rename temp file: {error}"))?;
+    sync_parent_dir(&path);
+    Ok(())
 }
 
 fn create_pending_tab_claim(
     session_key: &str,
-    tab_position: usize,
+    pending_claim_key: &str,
     plugin_id: u32,
     claim: &PendingTabClaim,
 ) -> Result<bool, String> {
-    let path = pending_tab_claim_path(session_key, tab_position);
+    let path = pending_tab_claim_path(session_key, pending_claim_key);
+    let temp_path = path.with_extension(format!("json.tmp-{plugin_id}"));
     let content =
         serde_json::to_vec(claim).map_err(|error| format!("serialize pending claim: {error}"))?;
 
@@ -1352,19 +1458,27 @@ fn create_pending_tab_claim(
         .ok_or_else(|| "missing pending claim parent directory".to_string())?;
     fs::create_dir_all(parent_dir).map_err(|error| format!("create state dir: {error}"))?;
 
-    let mut file = match OpenOptions::new().write(true).create_new(true).open(&path) {
-        Ok(file) => file,
-        Err(error) if error.kind() == ErrorKind::AlreadyExists => return Ok(false),
-        Err(error) => return Err(format!("create pending claim file: {error}")),
-    };
+    let mut file =
+        File::create(&temp_path).map_err(|error| format!("create temp claim file: {error}"))?;
     file.write_all(&content)
-        .map_err(|error| format!("write pending claim file: {error}"))?;
+        .map_err(|error| format!("write temp claim file: {error}"))?;
     file.sync_all()
-        .map_err(|error| format!("sync pending claim file: {error}"))?;
+        .map_err(|error| format!("sync temp claim file: {error}"))?;
     drop(file);
 
-    let _ = plugin_id;
+    fs::rename(&temp_path, &path).map_err(|error| format!("rename temp claim file: {error}"))?;
+    sync_parent_dir(&path);
     Ok(true)
+}
+
+fn sync_parent_dir(path: &PathBuf) {
+    let Some(parent_dir) = path.parent() else {
+        return;
+    };
+
+    if let Ok(parent_dir) = File::open(parent_dir) {
+        let _ = parent_dir.sync_all();
+    }
 }
 
 fn row_state_from_persisted(persisted: &PersistedTabState, schema: &Schema) -> Option<TabRowState> {
@@ -1445,6 +1559,54 @@ fn parse_bool_config(value: &str) -> bool {
     )
 }
 
+fn resolve_shared_state_host_folder(configured: Option<&str>) -> Result<PathBuf, String> {
+    let path = match configured.map(str::trim).filter(|value| !value.is_empty()) {
+        Some(configured) => expand_home_path(configured)?,
+        None => default_shared_state_host_folder()?,
+    };
+
+    if !path.is_absolute() {
+        return Err(format!(
+            "state_host_folder must be an absolute path, got {}",
+            path.display()
+        ));
+    }
+
+    Ok(path)
+}
+
+fn default_shared_state_host_folder() -> Result<PathBuf, String> {
+    if let Some(xdg_data_home) = std::env::var_os("XDG_DATA_HOME")
+        && !xdg_data_home.is_empty()
+    {
+        return Ok(PathBuf::from(xdg_data_home));
+    }
+
+    let Some(home) = std::env::var_os("HOME").filter(|home| !home.is_empty()) else {
+        return Err("state_host_folder is required when HOME is unavailable".to_string());
+    };
+
+    Ok(PathBuf::from(home).join(".local").join("share"))
+}
+
+fn expand_home_path(path: &str) -> Result<PathBuf, String> {
+    if path == "~" {
+        let Some(home) = std::env::var_os("HOME").filter(|home| !home.is_empty()) else {
+            return Err("cannot expand ~ because HOME is unavailable".to_string());
+        };
+        return Ok(PathBuf::from(home));
+    }
+
+    if let Some(rest) = path.strip_prefix("~/") {
+        let Some(home) = std::env::var_os("HOME").filter(|home| !home.is_empty()) else {
+            return Err("cannot expand ~/ because HOME is unavailable".to_string());
+        };
+        return Ok(PathBuf::from(home).join(rest));
+    }
+
+    Ok(PathBuf::from(path))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1476,6 +1638,16 @@ mod tests {
         }
     }
 
+    fn test_terminal_pane(pane_id: u32) -> PaneInfo {
+        PaneInfo {
+            id: pane_id,
+            is_plugin: false,
+            title: format!("terminal-{pane_id}"),
+            is_selectable: true,
+            ..Default::default()
+        }
+    }
+
     fn test_pane_manifest(plugin_ids: &[u32]) -> PaneManifest {
         PaneManifest {
             panes: HashMap::from_iter(plugin_ids.iter().enumerate().map(
@@ -1488,6 +1660,7 @@ mod tests {
     fn test_pipe_state(plugin_id: u32, session_name: &str, running_plugin_ids: &[u32]) -> State {
         State {
             plugin_id: Some(plugin_id),
+            shared_state_ready: true,
             mode_info: ModeInfo {
                 session_name: Some(session_name.to_string()),
                 ..Default::default()
@@ -1742,6 +1915,7 @@ mod tests {
     fn session_write_leader_ignores_other_plugin_urls() {
         let state = State {
             plugin_id: Some(22),
+            shared_state_ready: true,
             pane_manifest: PaneManifest {
                 panes: HashMap::from([
                     (0, vec![test_plugin_pane_with_url(11, "zellij:link")]),
@@ -1760,10 +1934,48 @@ mod tests {
     fn session_write_leader_waits_for_pane_manifest() {
         let state = State {
             plugin_id: Some(11),
+            shared_state_ready: true,
             ..Default::default()
         };
 
         assert!(!state.is_session_write_leader());
+    }
+
+    #[test]
+    fn pending_tab_claim_key_tracks_terminal_panes_across_position_shift() {
+        let state_before_close = State {
+            pane_manifest: PaneManifest {
+                panes: HashMap::from([(7, vec![test_terminal_pane(19), test_terminal_pane(20)])]),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let tab_before_close = TabInfo {
+            position: 7,
+            name: "status=\"IDLE\"".to_string(),
+            ..Default::default()
+        };
+        let state_after_close = State {
+            pane_manifest: PaneManifest {
+                panes: HashMap::from([(6, vec![test_terminal_pane(20), test_terminal_pane(19)])]),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let tab_after_close = TabInfo {
+            position: 6,
+            name: tab_before_close.name.clone(),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            state_before_close.pending_tab_claim_key_for_tab(&tab_before_close),
+            "panes-19_20"
+        );
+        assert_eq!(
+            state_after_close.pending_tab_claim_key_for_tab(&tab_after_close),
+            "panes-19_20"
+        );
     }
 
     #[test]
@@ -1781,6 +1993,27 @@ mod tests {
         assert!(!follower.reconcile_rows_with_tabs());
         assert!(follower.rows_by_tab_id.is_empty());
         assert!(follower.pending_tab_id_by_position.is_empty());
+    }
+
+    #[test]
+    fn session_key_waits_for_shared_state_mount() {
+        let state = State {
+            mode_info: ModeInfo {
+                session_name: Some("main".to_string()),
+                ..Default::default()
+            },
+            shared_state_ready: false,
+            ..Default::default()
+        };
+
+        assert_eq!(state.session_key(), None);
+    }
+
+    #[test]
+    fn resolves_configured_shared_state_host_folder() {
+        let path = resolve_shared_state_host_folder(Some("/tmp/super-tabs-state")).unwrap();
+
+        assert_eq!(path, PathBuf::from("/tmp/super-tabs-state"));
     }
 }
 

@@ -32,8 +32,11 @@ The plugin requests:
 
 - `ReadApplicationState`
 - `ChangeApplicationState`
+- `FullHdAccess`
 
 Grant them the first time Zellij prompts.
+
+`FullHdAccess` is used to mount a shared host state folder at `/host`, so multiple Super Tabs plugin instances can read the same persisted raw cell state. By default the host folder is `$XDG_DATA_HOME` or `$HOME/.local/share`; the plugin writes under the `super-tabs/` subdirectory. The host folder itself must already exist. You can override it with `state_host_folder`.
 
 ## Build
 
@@ -111,6 +114,7 @@ layout {
                 padding_top 0
                 overflow_above "  ^ +{count}"
                 overflow_below "  v +{count}"
+                state_host_folder "/Users/you/.local/share"
             }
         }
         pane
@@ -151,9 +155,9 @@ Super Tabs mirrors plain-text column values into the real Zellij tab name using 
 branch="main" | status="dirty" | title="api | worker"
 ```
 
-That lets the plugin hydrate plain-text state after restart or resurrection without filesystem persistence.
+That lets the plugin hydrate plain-text state after restart or resurrection even if shared filesystem state is unavailable.
 
-Runtime inline style overrides are intentionally not persisted. If you write a styled value and later write a plain value, the cell falls back to the column default style.
+When the shared host state folder is mounted, Super Tabs also persists raw cell values there, including inline style overrides. Writes use a temp file in the same directory followed by an atomic rename, so readers either see the previous complete JSON document or the next complete JSON document.
 
 ## Edge Cases
 
