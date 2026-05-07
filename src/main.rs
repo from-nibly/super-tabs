@@ -3,8 +3,9 @@ use std::collections::BTreeMap;
 use std::fs::{self, File};
 use std::io::{ErrorKind, Write};
 use std::path::PathBuf;
+use std::time::{SystemTime, UNIX_EPOCH};
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use super_tabs_core::{
     CellState, PIPE_NAME, SUPER_TAB_ID_KEY, Schema, StyledText, UpdatePayload, WidthIndex,
     apply_default_style, clip_right_edge, decode_super_tab_id, decode_tab_name,
@@ -16,6 +17,9 @@ use zellij_tile::prelude::*;
 const STATE_DIR: &str = "/host/super-tabs";
 const STATE_FILE_PREFIX: &str = "tab-";
 const PENDING_FILE_PREFIX: &str = "pending-";
+const LEADER_FILE_NAME: &str = "writer-leader.json";
+const LEADER_TTL_MS: u128 = 30_000;
+const WRITE_ROLE_CACHE_TTL_MS: u128 = 1_000;
 
 #[derive(Clone)]
 struct RenderConfig {
@@ -71,6 +75,277 @@ struct PendingTabClaim {
     tab_id: String,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct WriterLeaderClaim {
+    version: u8,
+    plugin_id: u32,
+    observed_at_ms: u128,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WriteRole {
+    Leader,
+    Follower,
+    Unavailable,
+}
+
+impl WriteRole {
+    fn can_write(self) -> bool {
+        matches!(self, Self::Leader)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum IdentityState {
+    Managed,
+    Pending { claim_key: String },
+    UnmanagedManual,
+    UnmanagedDefault,
+}
+
+impl IdentityState {
+    fn log_label(&self) -> String {
+        match self {
+            Self::Managed => "managed".to_string(),
+            Self::Pending { claim_key } => format!("pending({claim_key})"),
+            Self::UnmanagedManual => "unmanaged-manual".to_string(),
+            Self::UnmanagedDefault => "unmanaged-default".to_string(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RowSource {
+    Cached,
+    PersistedById,
+    PersistedByLegacyPosition,
+    LiveTabName,
+    EmptyNewManagedRow,
+    None,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RowLoadPolicy {
+    Stable,
+    PendingRename { legacy_position_fallback: bool },
+}
+
+impl RowLoadPolicy {
+    fn pending_rename(legacy_position_fallback: bool) -> Self {
+        Self::PendingRename {
+            legacy_position_fallback,
+        }
+    }
+
+    fn allow_live_name_mismatch(self) -> bool {
+        matches!(self, Self::PendingRename { .. })
+    }
+
+    fn allow_legacy_position_fallback(self) -> bool {
+        match self {
+            Self::Stable => false,
+            Self::PendingRename {
+                legacy_position_fallback,
+            } => legacy_position_fallback,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DeferredPipeReason {
+    UnresolvedPane,
+    MissingTab,
+    SharedStateUnavailable,
+}
+
+impl DeferredPipeReason {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::UnresolvedPane => "unresolved-pane",
+            Self::MissingTab => "missing-tab",
+            Self::SharedStateUnavailable => "shared-state-unavailable",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DropPipeReason {
+    FollowerUnmanagedTab,
+}
+
+impl DropPipeReason {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::FollowerUnmanagedTab => "follower-unmanaged-tab",
+        }
+    }
+}
+
+struct LoadedTabRow {
+    tab_id: String,
+    identity: IdentityState,
+    row: TabRowState,
+    row_source: RowSource,
+    rename_pending: bool,
+}
+
+struct LoadedRowState {
+    row: TabRowState,
+    source: RowSource,
+}
+
+struct ReconcilePlan {
+    rows_by_tab_id: BTreeMap<String, TabRowState>,
+    pending_tab_id_by_position: BTreeMap<usize, String>,
+    width_indexes: Vec<WidthIndex>,
+    effects: Vec<ReconcileEffect>,
+}
+
+enum ReconcileEffect {
+    PersistRow {
+        tab_position: usize,
+        tab_id: String,
+        mirrored_name: String,
+        row: TabRowState,
+    },
+    RenameTab {
+        tab_position: usize,
+        mirrored_name: String,
+    },
+}
+
+struct ResolvedTabTarget {
+    tab_id: String,
+    identity: IdentityState,
+    row_load_policy: RowLoadPolicy,
+}
+
+impl ResolvedTabTarget {
+    fn rename_pending(&self) -> bool {
+        self.row_load_policy.allow_live_name_mismatch()
+    }
+}
+
+enum TabTargetResolution {
+    Ready(ResolvedTabTarget),
+    Unmanaged(IdentityState),
+    Defer(DeferredPipeReason),
+    Drop(DropPipeReason),
+}
+
+#[derive(Clone)]
+struct SharedStateStore {
+    session_key: String,
+    plugin_id: u32,
+}
+
+impl SharedStateStore {
+    fn new(session_key: String, plugin_id: u32) -> Self {
+        Self {
+            session_key,
+            plugin_id,
+        }
+    }
+
+    fn persisted_tab_state_path(&self, tab_key: &str) -> PathBuf {
+        state_dir()
+            .join(&self.session_key)
+            .join(format!("{STATE_FILE_PREFIX}{tab_key}.json"))
+    }
+
+    fn pending_tab_claim_path(&self, pending_claim_key: &str) -> PathBuf {
+        state_dir()
+            .join(&self.session_key)
+            .join(format!("{PENDING_FILE_PREFIX}{pending_claim_key}.json"))
+    }
+
+    fn writer_leader_claim_path(&self) -> PathBuf {
+        state_dir().join(&self.session_key).join(LEADER_FILE_NAME)
+    }
+
+    fn read_persisted_tab_state(&self, tab_key: &str) -> Option<PersistedTabState> {
+        read_json_file(self.persisted_tab_state_path(tab_key))
+    }
+
+    fn write_persisted_tab_state(
+        &self,
+        tab_key: &str,
+        persisted: &PersistedTabState,
+    ) -> Result<(), String> {
+        write_json_file(
+            &self.persisted_tab_state_path(tab_key),
+            self.plugin_id,
+            persisted,
+            "persisted state",
+        )
+    }
+
+    fn read_pending_tab_claim(&self, pending_claim_key: &str) -> Option<PendingTabClaim> {
+        read_json_file(self.pending_tab_claim_path(pending_claim_key))
+    }
+
+    fn write_pending_tab_claim(
+        &self,
+        pending_claim_key: &str,
+        claim: &PendingTabClaim,
+    ) -> Result<(), String> {
+        write_json_file(
+            &self.pending_tab_claim_path(pending_claim_key),
+            self.plugin_id,
+            claim,
+            "pending claim",
+        )
+    }
+
+    fn clear_pending_tab_claim(&self, pending_claim_key: &str) -> Result<(), String> {
+        let path = self.pending_tab_claim_path(pending_claim_key);
+        match fs::remove_file(path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error.to_string()),
+        }
+    }
+
+    fn read_writer_leader_claim(&self) -> Option<WriterLeaderClaim> {
+        read_json_file(self.writer_leader_claim_path())
+    }
+
+    fn write_writer_leader_claim(&self, claim: &WriterLeaderClaim) -> Result<(), String> {
+        write_json_file(
+            &self.writer_leader_claim_path(),
+            self.plugin_id,
+            claim,
+            "writer leader",
+        )
+    }
+
+    fn claim_writer_leader(&self) -> bool {
+        let now_ms = current_time_ms();
+        let claim = WriterLeaderClaim {
+            version: 1,
+            plugin_id: self.plugin_id,
+            observed_at_ms: now_ms,
+        };
+
+        match self.read_writer_leader_claim() {
+            Some(current) if current.version == 1 && current.plugin_id == self.plugin_id => {
+                self.write_writer_leader_claim(&claim).is_ok()
+            }
+            Some(current)
+                if current.version == 1
+                    && now_ms.saturating_sub(current.observed_at_ms) <= LEADER_TTL_MS =>
+            {
+                false
+            }
+            _ => self.write_writer_leader_claim(&claim).is_ok_and(|()| {
+                self.read_writer_leader_claim().is_some_and(|current| {
+                    current.version == 1 && current.plugin_id == self.plugin_id
+                })
+            }),
+        }
+    }
+}
+
 #[derive(Default)]
 struct State {
     tabs: Vec<TabInfo>,
@@ -93,6 +368,9 @@ struct State {
     permissions_granted: bool,
     is_selectable: bool,
     pending_events: Vec<Event>,
+    pending_pipe_updates: Vec<UpdatePayload>,
+    cached_write_role: Option<WriteRole>,
+    cached_write_role_checked_at_ms: u128,
     load_error: Option<String>,
 }
 
@@ -214,6 +492,9 @@ impl ZellijPlugin for State {
                     "mode_update session={:?}",
                     self.mode_info.session_name
                 ));
+                if self.replay_pending_pipe_updates() {
+                    should_render = true;
+                }
             }
             Event::Visible(is_visible) if is_visible && self.reconcile_rows_with_tabs() => {
                 should_render = true;
@@ -245,6 +526,8 @@ impl ZellijPlugin for State {
                     "pane_update lookup={:?}",
                     self.pane_to_tab_position
                 ));
+                self.reconcile_rows_with_tabs();
+                self.replay_pending_pipe_updates();
                 should_render = true;
             }
             Event::HostFolderChanged(host_folder) => {
@@ -256,6 +539,9 @@ impl ZellijPlugin for State {
                         host_folder.display()
                     ));
                     if self.reconcile_rows_with_tabs() {
+                        should_render = true;
+                    }
+                    if self.replay_pending_pipe_updates() {
                         should_render = true;
                     }
                 } else {
@@ -432,163 +718,310 @@ impl State {
     }
 
     fn reconcile_rows_with_tabs(&mut self) -> bool {
-        let Some(schema) = self.schema.clone() else {
+        let Some(plan) = self.plan_reconcile_rows_with_tabs() else {
             return false;
         };
-        let allow_session_writes = self.is_session_write_leader();
+
+        self.apply_reconcile_plan(plan)
+    }
+
+    fn plan_reconcile_rows_with_tabs(&mut self) -> Option<ReconcilePlan> {
+        let Some(schema) = self.schema.clone() else {
+            return None;
+        };
+        let write_role = self.write_role();
 
         let tabs = self.tabs.clone();
         let mut next_rows = BTreeMap::new();
         let mut next_pending_tab_ids = BTreeMap::new();
         let mut next_width_indexes = vec![WidthIndex::default(); schema.len()];
+        let mut effects = Vec::new();
 
         for tab in &tabs {
-            let Some((mut tab_id, mut row, mut rename_pending)) =
-                self.load_row_state_for_tab(tab, &schema, allow_session_writes)
+            let Some(mut loaded) =
+                self.load_row_state_for_tab(tab, &schema, write_role, &mut effects)
             else {
+                if write_role.can_write()
+                    && is_default_zellij_tab_name(&tab.name)
+                    && self.has_terminal_panes_for_tab(tab.position)
+                {
+                    let target = self.ensure_pending_target_for_tab(tab, false);
+                    self.debug_log(format!(
+                        "claim_default tab={} id={} identity={} source={:?}",
+                        tab.position,
+                        target.tab_id,
+                        target.identity.log_label(),
+                        RowSource::None
+                    ));
+                    next_pending_tab_ids.insert(tab.position, target.tab_id);
+                }
                 continue;
             };
 
-            if next_rows.contains_key(&tab_id) {
-                if allow_session_writes {
-                    let duplicate_tab_id = tab_id;
-                    tab_id = self.ensure_pending_tab_id_for_tab(tab);
-                    row = TabRowState::empty(&schema);
-                    let mirrored_name =
-                        self.mirror_tab_row(tab.position, &tab_id, &mut row, &schema);
+            if next_rows.contains_key(&loaded.tab_id) {
+                if write_role.can_write() {
+                    let duplicate_tab_id = loaded.tab_id;
+                    let target = self.ensure_pending_target_for_tab(tab, false);
+                    loaded.tab_id = target.tab_id;
+                    loaded.identity = target.identity;
+                    loaded.row = TabRowState::empty(&schema);
+                    loaded.row_source = RowSource::EmptyNewManagedRow;
+                    let mirrored_name = self.plan_mirror_tab_row(
+                        tab.position,
+                        &loaded.tab_id,
+                        &mut loaded.row,
+                        &schema,
+                        &mut effects,
+                    );
                     self.debug_log(format!(
-                        "dedupe tab={} old_id={} new_id={} mirrored_name={}",
-                        tab.position, duplicate_tab_id, tab_id, mirrored_name
+                        "dedupe tab={} old_id={} new_id={} identity={} source={:?} mirrored_name={}",
+                        tab.position,
+                        duplicate_tab_id,
+                        loaded.tab_id,
+                        loaded.identity.log_label(),
+                        loaded.row_source,
+                        mirrored_name
                     ));
-                    rename_pending = true;
+                    loaded.rename_pending = true;
                 } else {
                     self.debug_log(format!(
                         "skip_dedupe tab={} id={} reason=follower",
-                        tab.position, tab_id
+                        tab.position, loaded.tab_id
                     ));
                     continue;
                 }
             }
 
-            if rename_pending {
-                next_pending_tab_ids.insert(tab.position, tab_id.clone());
+            if loaded.rename_pending {
+                next_pending_tab_ids.insert(tab.position, loaded.tab_id.clone());
             }
 
-            add_row_widths_to_indexes(&mut next_width_indexes, &row);
-            next_rows.insert(tab_id, row);
+            add_row_widths_to_indexes(&mut next_width_indexes, &loaded.row);
+            next_rows.insert(loaded.tab_id, loaded.row);
         }
 
-        let stale_pending_positions = self
-            .pending_tab_id_by_position
-            .keys()
-            .copied()
-            .collect::<Vec<_>>();
-        for pending_position in stale_pending_positions {
-            if !tabs.iter().any(|tab| tab.position == pending_position) {
-                self.pending_tab_id_by_position.remove(&pending_position);
-            }
+        Some(ReconcilePlan {
+            rows_by_tab_id: next_rows,
+            pending_tab_id_by_position: next_pending_tab_ids,
+            width_indexes: next_width_indexes,
+            effects,
+        })
+    }
+
+    fn apply_reconcile_plan(&mut self, plan: ReconcilePlan) -> bool {
+        let changed = self.rows_by_tab_id != plan.rows_by_tab_id
+            || self.pending_tab_id_by_position != plan.pending_tab_id_by_position
+            || self.width_indexes != plan.width_indexes;
+
+        self.rows_by_tab_id = plan.rows_by_tab_id;
+        self.pending_tab_id_by_position = plan.pending_tab_id_by_position;
+        self.width_indexes = plan.width_indexes;
+
+        for effect in plan.effects {
+            self.apply_reconcile_effect(effect);
         }
 
-        let changed = self.rows_by_tab_id != next_rows
-            || self.pending_tab_id_by_position != next_pending_tab_ids
-            || self.width_indexes != next_width_indexes;
-        self.rows_by_tab_id = next_rows;
-        self.pending_tab_id_by_position = next_pending_tab_ids;
-        self.width_indexes = next_width_indexes;
         changed
+    }
+
+    fn apply_reconcile_effect(&self, effect: ReconcileEffect) {
+        match effect {
+            ReconcileEffect::PersistRow {
+                tab_position,
+                tab_id,
+                mirrored_name,
+                row,
+            } => {
+                let Some(schema) = self.schema.as_ref() else {
+                    return;
+                };
+                self.write_persisted_row(&tab_id, tab_position, &mirrored_name, &row, schema);
+            }
+            ReconcileEffect::RenameTab {
+                tab_position,
+                mirrored_name,
+            } => self.rename_live_tab(tab_position, &mirrored_name),
+        }
     }
 
     fn load_row_state_for_tab(
         &mut self,
         tab: &TabInfo,
         schema: &Schema,
-        allow_session_writes: bool,
-    ) -> Option<(String, TabRowState, bool)> {
-        if allow_session_writes {
-            if let Some(tab_id) = self.refresh_pending_tab_id_for_tab(tab) {
-                self.observe_tab_id(&tab_id);
-
-                if let Some(row) = self.read_persisted_row_for_tab_id(&tab_id, schema) {
-                    self.debug_log(format!(
-                        "hydrate tab={} id={} source=pending-claim name={}",
-                        tab.position, tab_id, tab.name
-                    ));
-                    return Some((tab_id, row, true));
-                }
-
-                let mut row = self.read_legacy_persisted_row(tab.position, tab, schema)?;
-                let mirrored_name = self.mirror_tab_row(tab.position, &tab_id, &mut row, schema);
+        write_role: WriteRole,
+        effects: &mut Vec<ReconcileEffect>,
+    ) -> Option<LoadedTabRow> {
+        match self.resolve_tab_target(tab, write_role) {
+            TabTargetResolution::Ready(target) => {
+                self.load_reconcile_row_for_target(tab, schema, target, effects)
+            }
+            TabTargetResolution::Unmanaged(identity) if write_role.can_write() => {
                 self.debug_log(format!(
-                    "resume_pending tab={} id={} mirrored_name={}",
-                    tab.position, tab_id, mirrored_name
+                    "legacy_probe tab={} identity={}",
+                    tab.position,
+                    identity.log_label()
                 ));
-                return Some((tab_id, row, true));
+                let loaded_row = self.read_legacy_row_state(tab.position, tab, schema)?;
+                let target = self.ensure_pending_target_for_tab(tab, true);
+                self.mirror_reconcile_row_for_target(
+                    tab, schema, target, loaded_row, "migrate", effects,
+                )
             }
+            TabTargetResolution::Unmanaged(_)
+            | TabTargetResolution::Defer(_)
+            | TabTargetResolution::Drop(_) => None,
         }
-
-        if let Some(tab_id) = self.live_tab_id_for_tab(tab) {
-            self.observe_tab_id(&tab_id);
-            if allow_session_writes {
-                self.clear_pending_tab_claim_for_tab(tab);
-            }
-
-            if let Some(row) = self.read_persisted_row(&tab_id, tab, schema) {
-                self.debug_log(format!(
-                    "hydrate tab={} id={} source=cache name={}",
-                    tab.position, tab_id, tab.name
-                ));
-                return Some((tab_id, row, false));
-            }
-
-            let row = self.build_row_state_from_tab_name(tab, schema);
-            if row.is_some() {
-                self.debug_log(format!(
-                    "hydrate tab={} id={} source=tab-name name={}",
-                    tab.position, tab_id, tab.name
-                ));
-            }
-            return row.map(|row| (tab_id, row, false));
-        }
-
-        if !allow_session_writes {
-            return None;
-        }
-
-        let mut row = self.read_legacy_persisted_row(tab.position, tab, schema)?;
-        let tab_id = self.ensure_pending_tab_id_for_tab(tab);
-        self.observe_tab_id(&tab_id);
-        let mirrored_name = self.mirror_tab_row(tab.position, &tab_id, &mut row, schema);
-        self.debug_log(format!(
-            "migrate tab={} id={} mirrored_name={}",
-            tab.position, tab_id, mirrored_name
-        ));
-        Some((tab_id, row, true))
     }
 
-    fn read_legacy_persisted_row(
+    fn load_reconcile_row_for_target(
+        &mut self,
+        tab: &TabInfo,
+        schema: &Schema,
+        target: ResolvedTabTarget,
+        effects: &mut Vec<ReconcileEffect>,
+    ) -> Option<LoadedTabRow> {
+        let rename_pending = target.rename_pending();
+        match &target.identity {
+            IdentityState::Pending { .. } => {
+                if let Some(row) = self.read_persisted_row_for_tab_id(&target.tab_id, schema) {
+                    let loaded_row = LoadedRowState {
+                        row,
+                        source: RowSource::PersistedById,
+                    };
+                    return self.mirror_reconcile_row_for_target(
+                        tab, schema, target, loaded_row, "hydrate", effects,
+                    );
+                }
+
+                let loaded_row = self.read_legacy_row_state(tab.position, tab, schema)?;
+                self.mirror_reconcile_row_for_target(
+                    tab,
+                    schema,
+                    target,
+                    loaded_row,
+                    "resume_pending",
+                    effects,
+                )
+            }
+            IdentityState::Managed => {
+                if let Some(row) = self.read_persisted_row(&target.tab_id, tab, schema) {
+                    self.debug_log(format!(
+                        "hydrate tab={} id={} identity={} source={:?} name={}",
+                        tab.position,
+                        target.tab_id,
+                        target.identity.log_label(),
+                        RowSource::PersistedById,
+                        tab.name
+                    ));
+                    return Some(LoadedTabRow {
+                        tab_id: target.tab_id,
+                        identity: target.identity,
+                        row,
+                        row_source: RowSource::PersistedById,
+                        rename_pending,
+                    });
+                }
+
+                let row = self.build_row_state_from_tab_name(tab, schema);
+                if row.is_some() {
+                    self.debug_log(format!(
+                        "hydrate tab={} id={} identity={} source={:?} name={}",
+                        tab.position,
+                        target.tab_id,
+                        target.identity.log_label(),
+                        RowSource::LiveTabName,
+                        tab.name
+                    ));
+                }
+                row.map(|row| LoadedTabRow {
+                    tab_id: target.tab_id,
+                    identity: target.identity,
+                    row,
+                    row_source: RowSource::LiveTabName,
+                    rename_pending,
+                })
+            }
+            IdentityState::UnmanagedManual | IdentityState::UnmanagedDefault => None,
+        }
+    }
+
+    fn mirror_reconcile_row_for_target(
+        &self,
+        tab: &TabInfo,
+        schema: &Schema,
+        target: ResolvedTabTarget,
+        mut loaded_row: LoadedRowState,
+        action: &str,
+        effects: &mut Vec<ReconcileEffect>,
+    ) -> Option<LoadedTabRow> {
+        let rename_pending = target.rename_pending();
+        let mirrored_name = self.plan_mirror_tab_row(
+            tab.position,
+            &target.tab_id,
+            &mut loaded_row.row,
+            schema,
+            effects,
+        );
+        self.debug_log(format!(
+            "{} tab={} id={} identity={} source={:?} mirrored_name={}",
+            action,
+            tab.position,
+            target.tab_id,
+            target.identity.log_label(),
+            loaded_row.source,
+            mirrored_name
+        ));
+        Some(LoadedTabRow {
+            tab_id: target.tab_id,
+            identity: target.identity,
+            row: loaded_row.row,
+            row_source: loaded_row.source,
+            rename_pending,
+        })
+    }
+
+    fn read_legacy_row_state(
         &self,
         tab_position: usize,
         tab: &TabInfo,
         schema: &Schema,
-    ) -> Option<TabRowState> {
-        self.read_persisted_row_by_key(&tab_position.to_string(), tab_position, tab, schema)
-            .or_else(|| self.build_row_state_from_tab_name(tab, schema))
+    ) -> Option<LoadedRowState> {
+        if let Some(row) =
+            self.read_persisted_row_by_key(&tab_position.to_string(), tab_position, tab, schema)
+        {
+            return Some(LoadedRowState {
+                row,
+                source: RowSource::PersistedByLegacyPosition,
+            });
+        }
+
+        self.build_row_state_from_tab_name(tab, schema)
+            .map(|row| LoadedRowState {
+                row,
+                source: RowSource::LiveTabName,
+            })
     }
 
     fn load_cached_row_for_identity(
         &mut self,
         tab: &TabInfo,
         tab_id: &str,
-        allow_live_name_mismatch: bool,
-    ) -> Option<TabRowState> {
+        policy: RowLoadPolicy,
+    ) -> Option<LoadedRowState> {
         let cached_row = self.rows_by_tab_id.remove(tab_id)?;
 
         if cached_row.last_mirrored_tab_name.as_deref() == Some(tab.name.as_str()) {
-            return Some(cached_row);
+            return Some(LoadedRowState {
+                row: cached_row,
+                source: RowSource::Cached,
+            });
         }
 
-        if allow_live_name_mismatch {
-            return Some(cached_row);
+        if policy.allow_live_name_mismatch() {
+            return Some(LoadedRowState {
+                row: cached_row,
+                source: RowSource::Cached,
+            });
         }
 
         None
@@ -608,18 +1041,38 @@ impl State {
         mirrored_name
     }
 
+    fn plan_mirror_tab_row(
+        &self,
+        tab_position: usize,
+        tab_id: &str,
+        row: &mut TabRowState,
+        schema: &Schema,
+        effects: &mut Vec<ReconcileEffect>,
+    ) -> String {
+        let mirrored_name = encode_tab_name_with_id(schema.columns(), &row.cells, Some(tab_id));
+        row.last_mirrored_tab_name = Some(mirrored_name.clone());
+        effects.push(ReconcileEffect::PersistRow {
+            tab_position,
+            tab_id: tab_id.to_string(),
+            mirrored_name: mirrored_name.clone(),
+            row: row.clone(),
+        });
+        effects.push(ReconcileEffect::RenameTab {
+            tab_position,
+            mirrored_name: mirrored_name.clone(),
+        });
+        mirrored_name
+    }
+
     fn clear_pending_tab_claim_for_tab(&mut self, tab: &TabInfo) {
         self.pending_tab_id_by_position.remove(&tab.position);
 
-        let Some(session_key) = self.session_key() else {
+        let Some(store) = self.state_store() else {
             return;
         };
 
         let pending_claim_key = self.pending_tab_claim_key_for_tab(tab);
-        let path = pending_tab_claim_path(session_key.as_str(), &pending_claim_key);
-        if let Err(error) = fs::remove_file(&path)
-            && error.kind() != ErrorKind::NotFound
-        {
+        if let Err(error) = store.clear_pending_tab_claim(&pending_claim_key) {
             eprintln!(
                 "super-tabs: failed to clear pending tab claim for position {}: {error}",
                 tab.position
@@ -653,13 +1106,74 @@ impl State {
         )
     }
 
+    fn has_terminal_panes_for_tab(&self, tab_position: usize) -> bool {
+        self.pane_manifest
+            .panes
+            .get(&tab_position)
+            .is_some_and(|panes| panes.iter().any(|pane| !pane.is_plugin))
+    }
+
+    fn resolve_tab_target(&mut self, tab: &TabInfo, write_role: WriteRole) -> TabTargetResolution {
+        if write_role.can_write()
+            && let Some(tab_id) = self.refresh_pending_tab_id_for_tab(tab)
+        {
+            self.observe_tab_id(&tab_id);
+            return TabTargetResolution::Ready(ResolvedTabTarget {
+                tab_id,
+                identity: IdentityState::Pending {
+                    claim_key: self.pending_tab_claim_key_for_tab(tab),
+                },
+                row_load_policy: RowLoadPolicy::pending_rename(false),
+            });
+        }
+
+        if let Some(tab_id) = self.live_tab_id_for_tab(tab) {
+            self.observe_tab_id(&tab_id);
+            if write_role.can_write() {
+                self.clear_pending_tab_claim_for_tab(tab);
+            }
+            return TabTargetResolution::Ready(ResolvedTabTarget {
+                tab_id,
+                identity: IdentityState::Managed,
+                row_load_policy: RowLoadPolicy::Stable,
+            });
+        }
+
+        if write_role.can_write() {
+            return TabTargetResolution::Unmanaged(self.unmanaged_identity_for_tab(tab));
+        }
+
+        if write_role == WriteRole::Unavailable {
+            TabTargetResolution::Defer(DeferredPipeReason::SharedStateUnavailable)
+        } else {
+            TabTargetResolution::Drop(DropPipeReason::FollowerUnmanagedTab)
+        }
+    }
+
+    fn ensure_pending_target_for_tab(
+        &mut self,
+        tab: &TabInfo,
+        legacy_position_fallback: bool,
+    ) -> ResolvedTabTarget {
+        let tab_id = self.ensure_pending_tab_id_for_tab(tab);
+        self.observe_tab_id(&tab_id);
+
+        ResolvedTabTarget {
+            tab_id,
+            identity: IdentityState::Pending {
+                claim_key: self.pending_tab_claim_key_for_tab(tab),
+            },
+            row_load_policy: RowLoadPolicy::pending_rename(legacy_position_fallback),
+        }
+    }
+
     fn refresh_pending_tab_id_for_tab(&mut self, tab: &TabInfo) -> Option<String> {
-        let Some(session_key) = self.session_key() else {
+        let Some(store) = self.state_store() else {
             self.pending_tab_id_by_position.remove(&tab.position);
             return None;
         };
         let pending_claim_key = self.pending_tab_claim_key_for_tab(tab);
-        let Some(claim) = read_pending_tab_claim(session_key.as_str(), &pending_claim_key) else {
+        let Some(claim) = store.read_pending_tab_claim(&pending_claim_key) else {
             self.pending_tab_id_by_position.remove(&tab.position);
             return None;
         };
@@ -679,7 +1193,7 @@ impl State {
             return tab_id;
         }
 
-        let Some(session_key) = self.session_key() else {
+        let Some(store) = self.state_store() else {
             let tab_id = self.mint_super_tab_id();
             self.pending_tab_id_by_position
                 .insert(tab.position, tab_id.clone());
@@ -694,21 +1208,11 @@ impl State {
                 tab_id: tab_id.clone(),
             };
 
-            match create_pending_tab_claim(
-                session_key.as_str(),
-                &self.pending_tab_claim_key_for_tab(tab),
-                self.plugin_id.unwrap_or(0),
-                &claim,
-            ) {
-                Ok(true) => {
+            match store.write_pending_tab_claim(&self.pending_tab_claim_key_for_tab(tab), &claim) {
+                Ok(()) => {
                     self.pending_tab_id_by_position
                         .insert(tab.position, tab_id.clone());
                     return tab_id;
-                }
-                Ok(false) => {
-                    if let Some(tab_id) = self.refresh_pending_tab_id_for_tab(tab) {
-                        return tab_id;
-                    }
                 }
                 Err(error) => {
                     eprintln!(
@@ -742,13 +1246,21 @@ impl State {
     }
 
     fn managed_tab_fallback_name(&self, tab: &TabInfo) -> Option<String> {
+        match self.unmanaged_identity_for_tab(tab) {
+            IdentityState::UnmanagedManual => Some(tab.name.clone()),
+            IdentityState::UnmanagedDefault => None,
+            IdentityState::Managed | IdentityState::Pending { .. } => None,
+        }
+    }
+
+    fn unmanaged_identity_for_tab(&self, tab: &TabInfo) -> IdentityState {
         let trimmed_name = tab.name.trim();
-        if trimmed_name.is_empty() || trimmed_name.starts_with("Tab #") {
-            return None;
+        if trimmed_name.is_empty() || is_default_zellij_tab_name(trimmed_name) {
+            return IdentityState::UnmanagedDefault;
         }
 
         let Some(parsed_name) = decode_tab_name(&tab.name) else {
-            return Some(tab.name.clone());
+            return IdentityState::UnmanagedManual;
         };
         let has_super_tab_id = parsed_name.contains_key(SUPER_TAB_ID_KEY);
         let has_other_values = parsed_name
@@ -756,10 +1268,10 @@ impl State {
             .any(|(key, value)| key != SUPER_TAB_ID_KEY && !value.is_empty());
 
         if has_super_tab_id && !has_other_values {
-            return None;
+            return IdentityState::UnmanagedDefault;
         }
 
-        Some(tab.name.clone())
+        IdentityState::UnmanagedManual
     }
 
     fn build_row_state_from_tab_name(&self, tab: &TabInfo, schema: &Schema) -> Option<TabRowState> {
@@ -798,8 +1310,8 @@ impl State {
     }
 
     fn read_persisted_row_for_tab_id(&self, tab_id: &str, schema: &Schema) -> Option<TabRowState> {
-        let session_key = self.session_key()?;
-        let persisted = read_persisted_tab_state(session_key.as_str(), tab_id)?;
+        let store = self.state_store()?;
+        let persisted = store.read_persisted_tab_state(tab_id)?;
         row_state_from_persisted(&persisted, schema)
     }
 
@@ -810,17 +1322,12 @@ impl State {
         tab: &TabInfo,
         schema: &Schema,
     ) -> Option<TabRowState> {
-        let session_key = self.session_key()?;
-        let path = persisted_tab_state_path(session_key.as_str(), tab_key);
-        let persisted = read_persisted_tab_state(session_key.as_str(), tab_key)?;
+        let store = self.state_store()?;
+        let persisted = store.read_persisted_tab_state(tab_key)?;
         if persisted.version != 1 || persisted.mirrored_name != tab.name {
             self.debug_log(format!(
-                "cache_miss tab={} key={} path={} mirrored_name={} live_name={}",
-                tab_position,
-                tab_key,
-                path.display(),
-                persisted.mirrored_name,
-                tab.name
+                "cache_miss tab={} key={} mirrored_name={} live_name={}",
+                tab_position, tab_key, persisted.mirrored_name, tab.name
             ));
             return None;
         }
@@ -865,7 +1372,7 @@ impl State {
             cells,
         };
 
-        let Some(session_key) = self.session_key() else {
+        let Some(store) = self.state_store() else {
             self.debug_log(format!(
                 "skip_persist tab={} id={} reason=no-session-key",
                 tab_position, tab_id
@@ -873,33 +1380,19 @@ impl State {
             return;
         };
 
-        let path = persisted_tab_state_path(session_key.as_str(), tab_id);
-
-        if let Err(error) = write_persisted_tab_state(
-            session_key.as_str(),
-            tab_id,
-            self.plugin_id.unwrap_or(0),
-            &persisted,
-        ) {
+        if let Err(error) = store.write_persisted_tab_state(tab_id, &persisted) {
             eprintln!(
                 "super-tabs: failed to persist tab state for position {tab_position} ({tab_id}): {error}"
             );
         } else {
             self.debug_log(format!(
-                "persist tab={} id={} path={} mirrored_name={}",
-                tab_position,
-                tab_id,
-                path.display(),
-                mirrored_name
+                "persist tab={} id={} mirrored_name={}",
+                tab_position, tab_id, mirrored_name
             ));
         }
     }
 
     fn handle_update_pipe(&mut self, payload: Option<&str>) -> bool {
-        let Some(schema) = self.schema.clone() else {
-            return false;
-        };
-        let allow_session_writes = self.is_session_write_leader();
         let Some(payload) = payload else {
             return false;
         };
@@ -907,8 +1400,17 @@ impl State {
             self.debug_log("pipe ignored invalid payload");
             return false;
         };
+        self.handle_update_payload(payload)
+    }
+
+    fn handle_update_payload(&mut self, payload: UpdatePayload) -> bool {
+        let Some(schema) = self.schema.clone() else {
+            return false;
+        };
+        let write_role = self.write_role();
         let resolved_tab_position = self.pane_to_tab_position.get(&payload.pane_id).copied();
         let Some(tab_position) = resolved_tab_position else {
+            self.defer_pipe_update(payload, DeferredPipeReason::UnresolvedPane);
             return false;
         };
         let Some(tab) = self
@@ -917,81 +1419,141 @@ impl State {
             .find(|tab| tab.position == tab_position)
             .cloned()
         else {
+            self.defer_pipe_update(payload, DeferredPipeReason::MissingTab);
             return false;
         };
-        let live_tab_id = self.live_tab_id_for_tab(&tab);
-        let (tab_id, rename_pending, allow_legacy_position_fallback) = if allow_session_writes {
-            let resolved_tab_id = self
-                .refresh_pending_tab_id_for_tab(&tab)
-                .or_else(|| live_tab_id.clone());
-            let allow_legacy_position_fallback = resolved_tab_id.is_none();
-            let tab_id = match resolved_tab_id {
-                Some(tab_id) => {
-                    self.observe_tab_id(&tab_id);
-                    tab_id
-                }
-                None => self.ensure_pending_tab_id_for_tab(&tab),
-            };
-            let rename_pending = live_tab_id.as_deref() != Some(tab_id.as_str());
-            (tab_id, rename_pending, allow_legacy_position_fallback)
-        } else {
-            let Some(tab_id) = live_tab_id.clone() else {
+        let target = match self.resolve_tab_target(&tab, write_role) {
+            TabTargetResolution::Ready(target) => target,
+            TabTargetResolution::Unmanaged(identity) if write_role.can_write() => {
                 self.debug_log(format!(
-                    "pipe ignored follower unmanaged tab pane_id={} tab={}",
-                    payload.pane_id, tab.position
+                    "pipe unmanaged tab={} identity={}",
+                    tab.position,
+                    identity.log_label()
                 ));
+                self.ensure_pending_target_for_tab(&tab, true)
+            }
+            TabTargetResolution::Unmanaged(_) => {
+                self.drop_pipe_update(&payload, DropPipeReason::FollowerUnmanagedTab, tab.position);
                 return false;
-            };
-            (tab_id, false, false)
+            }
+            TabTargetResolution::Defer(reason) => {
+                self.defer_pipe_update(payload, reason);
+                return false;
+            }
+            TabTargetResolution::Drop(reason) => {
+                self.drop_pipe_update(&payload, reason, tab.position);
+                return false;
+            }
         };
         self.debug_log(format!(
             "pipe pane_id={} resolved_tab={resolved_tab_position:?} tab_id={} updates={:?}",
-            payload.pane_id, tab_id, payload.updates
+            payload.pane_id, target.tab_id, payload.updates
         ));
 
-        let mut row = self.row_state_for_update(
-            &tab,
-            &tab_id,
-            &schema,
-            rename_pending,
-            allow_legacy_position_fallback,
+        let mut loaded_row =
+            self.row_state_for_update(&tab, &target.tab_id, &schema, target.row_load_policy);
+        let changed = apply_updates_to_row(&mut loaded_row.row, &schema, payload.updates);
+        let mirrored_name = encode_tab_name_with_id(
+            schema.columns(),
+            &loaded_row.row.cells,
+            Some(target.tab_id.as_str()),
         );
-        let changed = apply_updates_to_row(&mut row, &schema, payload.updates);
-        let mirrored_name =
-            encode_tab_name_with_id(schema.columns(), &row.cells, Some(tab_id.as_str()));
+        self.debug_log(format!(
+            "pipe row tab={} id={} identity={} source={:?} rename_pending={}",
+            tab_position,
+            target.tab_id,
+            target.identity.log_label(),
+            loaded_row.source,
+            target.rename_pending()
+        ));
 
-        if !changed && row.last_mirrored_tab_name.as_deref() == Some(mirrored_name.as_str()) {
-            self.rows_by_tab_id.insert(tab_id.clone(), row);
-            if allow_session_writes && rename_pending {
-                self.pending_tab_id_by_position.insert(tab_position, tab_id);
-            } else if allow_session_writes {
+        if !changed
+            && loaded_row.row.last_mirrored_tab_name.as_deref() == Some(mirrored_name.as_str())
+        {
+            self.rows_by_tab_id
+                .insert(target.tab_id.clone(), loaded_row.row);
+            if write_role.can_write() && target.rename_pending() {
+                self.pending_tab_id_by_position
+                    .insert(tab_position, target.tab_id);
+            } else if write_role.can_write() {
                 self.clear_pending_tab_claim_for_tab(&tab);
             }
             return false;
         }
 
-        self.rows_by_tab_id.insert(tab_id.clone(), row.clone());
-        if allow_session_writes && rename_pending {
+        self.rows_by_tab_id
+            .insert(target.tab_id.clone(), loaded_row.row.clone());
+        if write_role.can_write() && target.rename_pending() {
             self.pending_tab_id_by_position
-                .insert(tab_position, tab_id.clone());
-        } else if allow_session_writes {
+                .insert(tab_position, target.tab_id.clone());
+        } else if write_role.can_write() {
             self.clear_pending_tab_claim_for_tab(&tab);
         }
 
-        if !allow_session_writes {
+        if !write_role.can_write() {
             self.recompute_width_indexes();
             return changed;
         }
 
-        let mirrored_name = self.mirror_tab_row(tab_position, &tab_id, &mut row, &schema);
-        self.rows_by_tab_id.insert(tab_id.clone(), row);
+        let mirrored_name =
+            self.mirror_tab_row(tab_position, &target.tab_id, &mut loaded_row.row, &schema);
+        self.rows_by_tab_id
+            .insert(target.tab_id.clone(), loaded_row.row);
         self.debug_log(format!(
             "rename target_tab={} id={} mirrored_name={}",
-            tab_position, tab_id, mirrored_name
+            tab_position, target.tab_id, mirrored_name
         ));
 
         self.recompute_width_indexes();
         true
+    }
+
+    fn defer_pipe_update(&mut self, payload: UpdatePayload, reason: DeferredPipeReason) {
+        self.debug_log(format!(
+            "pipe deferred pane_id={} reason={} updates={:?}",
+            payload.pane_id,
+            reason.as_str(),
+            payload.updates
+        ));
+
+        if self.pending_pipe_updates.contains(&payload) {
+            return;
+        }
+
+        self.pending_pipe_updates.push(payload);
+        if self.pending_pipe_updates.len() > 64 {
+            self.pending_pipe_updates.remove(0);
+        }
+    }
+
+    fn drop_pipe_update(
+        &self,
+        payload: &UpdatePayload,
+        reason: DropPipeReason,
+        tab_position: usize,
+    ) {
+        self.debug_log(format!(
+            "pipe dropped pane_id={} tab={} reason={} updates={:?}",
+            payload.pane_id,
+            tab_position,
+            reason.as_str(),
+            payload.updates
+        ));
+    }
+
+    fn replay_pending_pipe_updates(&mut self) -> bool {
+        if self.pending_pipe_updates.is_empty() {
+            return false;
+        }
+
+        let pending_updates = std::mem::take(&mut self.pending_pipe_updates);
+        let mut changed = false;
+        for payload in pending_updates {
+            if self.handle_update_payload(payload) {
+                changed = true;
+            }
+        }
+        changed
     }
 
     fn row_state_for_update(
@@ -999,30 +1561,43 @@ impl State {
         tab: &TabInfo,
         tab_id: &str,
         schema: &Schema,
-        allow_live_name_mismatch: bool,
-        allow_legacy_position_fallback: bool,
-    ) -> TabRowState {
-        if let Some(row) = self.load_cached_row_for_identity(tab, tab_id, allow_live_name_mismatch)
-        {
-            return row;
+        policy: RowLoadPolicy,
+    ) -> LoadedRowState {
+        if let Some(loaded) = self.load_cached_row_for_identity(tab, tab_id, policy) {
+            return loaded;
         }
 
-        if allow_live_name_mismatch {
+        if policy.allow_live_name_mismatch() {
             if let Some(row) = self.read_persisted_row_for_tab_id(tab_id, schema) {
-                return row;
+                return LoadedRowState {
+                    row,
+                    source: RowSource::PersistedById,
+                };
             }
         } else if let Some(row) = self.read_persisted_row(tab_id, tab, schema) {
-            return row;
+            return LoadedRowState {
+                row,
+                source: RowSource::PersistedById,
+            };
         }
 
-        if allow_legacy_position_fallback
-            && let Some(row) = self.read_legacy_persisted_row(tab.position, tab, schema)
+        if policy.allow_legacy_position_fallback()
+            && let Some(loaded) = self.read_legacy_row_state(tab.position, tab, schema)
         {
-            return row;
+            return loaded;
         }
 
-        self.build_row_state_from_tab_name(tab, schema)
-            .unwrap_or_else(|| TabRowState::empty(schema))
+        if let Some(row) = self.build_row_state_from_tab_name(tab, schema) {
+            return LoadedRowState {
+                row,
+                source: RowSource::LiveTabName,
+            };
+        }
+
+        LoadedRowState {
+            row: TabRowState::empty(schema),
+            source: RowSource::EmptyNewManagedRow,
+        }
     }
 
     fn recompute_width_indexes(&mut self) {
@@ -1070,38 +1645,45 @@ impl State {
             .filter(|session_name| !session_name.is_empty())
     }
 
-    // Every plugin instance in the session observes the same pane manifest, so
-    // elect a single writer deterministically from the shared plugin_url + id.
-    fn is_session_write_leader(&self) -> bool {
-        if !self.shared_state_ready {
-            return false;
-        }
-
-        let Some(plugin_id) = self.plugin_id else {
-            return true;
-        };
-
-        self.session_write_leader_plugin_id() == Some(plugin_id)
+    fn state_store(&self) -> Option<SharedStateStore> {
+        Some(SharedStateStore::new(
+            self.session_key()?,
+            self.plugin_id.unwrap_or(0),
+        ))
     }
 
-    fn session_write_leader_plugin_id(&self) -> Option<u32> {
-        let own_plugin_id = self.plugin_id?;
-        let own_plugin_url = self
-            .pane_manifest
-            .panes
-            .values()
-            .flatten()
-            .find(|pane| pane.is_plugin && pane.id == own_plugin_id)?
-            .plugin_url
-            .as_deref()?;
+    fn write_role(&mut self) -> WriteRole {
+        let now_ms = current_time_ms();
+        if let Some(cached_write_role) = self.cached_write_role
+            && now_ms.saturating_sub(self.cached_write_role_checked_at_ms)
+                <= WRITE_ROLE_CACHE_TTL_MS
+        {
+            return cached_write_role;
+        }
 
-        self.pane_manifest
-            .panes
-            .values()
-            .flatten()
-            .filter(|pane| pane.is_plugin && pane.plugin_url.as_deref() == Some(own_plugin_url))
-            .map(|pane| pane.id)
-            .min()
+        let write_role = self.compute_write_role();
+        self.cached_write_role = Some(write_role);
+        self.cached_write_role_checked_at_ms = now_ms;
+        write_role
+    }
+
+    fn compute_write_role(&self) -> WriteRole {
+        if !self.shared_state_ready {
+            return WriteRole::Unavailable;
+        }
+
+        if self.plugin_id.is_none() {
+            return WriteRole::Leader;
+        }
+        let Some(store) = self.state_store() else {
+            return WriteRole::Unavailable;
+        };
+
+        if store.claim_writer_leader() {
+            WriteRole::Leader
+        } else {
+            WriteRole::Follower
+        }
     }
 
     fn rename_live_tab(&self, tab_position: usize, mirrored_name: &str) {
@@ -1379,6 +1961,14 @@ fn build_terminal_pane_lookup(pane_manifest: &PaneManifest) -> BTreeMap<u32, usi
     pane_to_tab_position
 }
 
+fn is_default_zellij_tab_name(name: &str) -> bool {
+    let Some(number) = name.trim().strip_prefix("Tab #") else {
+        return false;
+    };
+
+    !number.is_empty() && number.chars().all(|ch| ch.is_ascii_digit())
+}
+
 #[cfg(test)]
 fn state_dir() -> PathBuf {
     std::env::temp_dir().join("super-tabs-tests")
@@ -1389,86 +1979,45 @@ fn state_dir() -> PathBuf {
     PathBuf::from(STATE_DIR)
 }
 
-fn persisted_tab_state_path(session_key: &str, tab_key: &str) -> PathBuf {
-    state_dir()
-        .join(session_key)
-        .join(format!("{STATE_FILE_PREFIX}{tab_key}.json"))
-}
-
-fn pending_tab_claim_path(session_key: &str, pending_claim_key: &str) -> PathBuf {
-    state_dir()
-        .join(session_key)
-        .join(format!("{PENDING_FILE_PREFIX}{pending_claim_key}.json"))
-}
-
-fn read_persisted_tab_state(session_key: &str, tab_key: &str) -> Option<PersistedTabState> {
-    let path = persisted_tab_state_path(session_key, tab_key);
+fn read_json_file<T>(path: PathBuf) -> Option<T>
+where
+    T: DeserializeOwned,
+{
     let content = fs::read_to_string(path).ok()?;
     serde_json::from_str(&content).ok()
 }
 
-fn read_pending_tab_claim(session_key: &str, pending_claim_key: &str) -> Option<PendingTabClaim> {
-    let path = pending_tab_claim_path(session_key, pending_claim_key);
-    let content = fs::read_to_string(path).ok()?;
-    serde_json::from_str(&content).ok()
-}
-
-fn write_persisted_tab_state(
-    session_key: &str,
-    tab_key: &str,
-    plugin_id: u32,
-    persisted: &PersistedTabState,
-) -> Result<(), String> {
-    let path = persisted_tab_state_path(session_key, tab_key);
+fn write_json_file<T>(path: &PathBuf, plugin_id: u32, value: &T, label: &str) -> Result<(), String>
+where
+    T: Serialize,
+{
     let temp_path = path.with_extension(format!("json.tmp-{plugin_id}"));
-    let content = serde_json::to_vec(persisted)
-        .map_err(|error| format!("serialize persisted state: {error}"))?;
+    let content =
+        serde_json::to_vec(value).map_err(|error| format!("serialize {label}: {error}"))?;
 
     let parent_dir = path
         .parent()
-        .ok_or_else(|| "missing persisted state parent directory".to_string())?;
+        .ok_or_else(|| format!("missing {label} parent directory"))?;
     fs::create_dir_all(parent_dir).map_err(|error| format!("create state dir: {error}"))?;
 
     let mut file =
-        File::create(&temp_path).map_err(|error| format!("create temp file: {error}"))?;
+        File::create(&temp_path).map_err(|error| format!("create temp {label} file: {error}"))?;
     file.write_all(&content)
-        .map_err(|error| format!("write temp file: {error}"))?;
+        .map_err(|error| format!("write temp {label} file: {error}"))?;
     file.sync_all()
-        .map_err(|error| format!("sync temp file: {error}"))?;
+        .map_err(|error| format!("sync temp {label} file: {error}"))?;
     drop(file);
 
-    fs::rename(&temp_path, &path).map_err(|error| format!("rename temp file: {error}"))?;
-    sync_parent_dir(&path);
+    fs::rename(&temp_path, path).map_err(|error| format!("rename temp {label} file: {error}"))?;
+    sync_parent_dir(path);
     Ok(())
 }
 
-fn create_pending_tab_claim(
-    session_key: &str,
-    pending_claim_key: &str,
-    plugin_id: u32,
-    claim: &PendingTabClaim,
-) -> Result<bool, String> {
-    let path = pending_tab_claim_path(session_key, pending_claim_key);
-    let temp_path = path.with_extension(format!("json.tmp-{plugin_id}"));
-    let content =
-        serde_json::to_vec(claim).map_err(|error| format!("serialize pending claim: {error}"))?;
-
-    let parent_dir = path
-        .parent()
-        .ok_or_else(|| "missing pending claim parent directory".to_string())?;
-    fs::create_dir_all(parent_dir).map_err(|error| format!("create state dir: {error}"))?;
-
-    let mut file =
-        File::create(&temp_path).map_err(|error| format!("create temp claim file: {error}"))?;
-    file.write_all(&content)
-        .map_err(|error| format!("write temp claim file: {error}"))?;
-    file.sync_all()
-        .map_err(|error| format!("sync temp claim file: {error}"))?;
-    drop(file);
-
-    fs::rename(&temp_path, &path).map_err(|error| format!("rename temp claim file: {error}"))?;
-    sync_parent_dir(&path);
-    Ok(true)
+fn current_time_ms() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis())
+        .unwrap_or(0)
 }
 
 fn sync_parent_dir(path: &PathBuf) {
@@ -1621,6 +2170,15 @@ mod tests {
         }
 
         Schema::from_config(&config).unwrap()
+    }
+
+    fn unique_session_name(label: &str) -> String {
+        format!("super-tabs-{label}-{}", current_time_ms())
+    }
+
+    fn cleanup_session(session_name: &str) {
+        let session_key = sanitize_session_key(session_name);
+        let _ = std::fs::remove_dir_all(state_dir().join(session_key));
     }
 
     fn test_plugin_pane(plugin_id: u32) -> PaneInfo {
@@ -1860,9 +2418,10 @@ mod tests {
                 .expect("stale tab name should decode"),
         );
 
-        let row = state.row_state_for_update(&live_tab, "st-14", &schema, false, false);
+        let loaded = state.row_state_for_update(&live_tab, "st-14", &schema, RowLoadPolicy::Stable);
 
-        assert_eq!(row.cells[0].as_ref().unwrap().raw_input, "ACTIVE");
+        assert_eq!(loaded.source, RowSource::LiveTabName);
+        assert_eq!(loaded.row.cells[0].as_ref().unwrap().raw_input, "ACTIVE");
     }
 
     #[test]
@@ -1892,9 +2451,15 @@ mod tests {
                 .expect("cached tab name should decode"),
         );
 
-        let row = state.row_state_for_update(&legacy_tab, "st-2", &schema, true, false);
+        let loaded = state.row_state_for_update(
+            &legacy_tab,
+            "st-2",
+            &schema,
+            RowLoadPolicy::pending_rename(false),
+        );
 
-        assert_eq!(row.cells[0].as_ref().unwrap().raw_input, "RUNNING");
+        assert_eq!(loaded.source, RowSource::Cached);
+        assert_eq!(loaded.row.cells[0].as_ref().unwrap().raw_input, "RUNNING");
         assert_eq!(
             state.resolved_tab_id_for_tab(&legacy_tab).as_deref(),
             Some("st-2")
@@ -1902,43 +2467,58 @@ mod tests {
     }
 
     #[test]
-    fn session_write_leader_is_lowest_plugin_id_for_shared_plugin_url() {
-        let leader = test_pipe_state(11, "main", &[11, 22]);
-        let follower = test_pipe_state(22, "main", &[11, 22]);
+    fn session_write_leader_claim_allows_one_writer() {
+        let session_name = unique_session_name("writer-leader");
+        cleanup_session(&session_name);
+        let mut leader = test_pipe_state(11, &session_name, &[11, 22]);
+        let mut follower = test_pipe_state(22, &session_name, &[11, 22]);
 
-        assert_eq!(leader.session_write_leader_plugin_id(), Some(11));
-        assert!(leader.is_session_write_leader());
-        assert!(!follower.is_session_write_leader());
+        assert_eq!(leader.write_role(), WriteRole::Leader);
+        assert_eq!(follower.write_role(), WriteRole::Follower);
+
+        cleanup_session(&session_name);
     }
 
     #[test]
-    fn session_write_leader_ignores_other_plugin_urls() {
-        let state = State {
+    fn session_write_leader_reclaims_stale_claim() {
+        let session_name = unique_session_name("writer-leader-stale");
+        cleanup_session(&session_name);
+        let session_key = sanitize_session_key(&session_name);
+        SharedStateStore::new(session_key.clone(), 11)
+            .write_writer_leader_claim(&WriterLeaderClaim {
+                version: 1,
+                plugin_id: 11,
+                observed_at_ms: 0,
+            })
+            .unwrap();
+
+        let mut replacement = test_pipe_state(22, &session_name, &[11, 22]);
+
+        assert_eq!(replacement.write_role(), WriteRole::Leader);
+        assert_eq!(
+            SharedStateStore::new(session_key, 22)
+                .read_writer_leader_claim()
+                .unwrap()
+                .plugin_id,
+            22
+        );
+
+        cleanup_session(&session_name);
+    }
+
+    #[test]
+    fn session_write_leader_waits_for_shared_state_mount() {
+        let mut state = State {
             plugin_id: Some(22),
-            shared_state_ready: true,
-            pane_manifest: PaneManifest {
-                panes: HashMap::from([
-                    (0, vec![test_plugin_pane_with_url(11, "zellij:link")]),
-                    (1, vec![test_plugin_pane(22)]),
-                ]),
+            mode_info: ModeInfo {
+                session_name: Some("main".to_string()),
                 ..Default::default()
             },
+            shared_state_ready: false,
             ..Default::default()
         };
 
-        assert_eq!(state.session_write_leader_plugin_id(), Some(22));
-        assert!(state.is_session_write_leader());
-    }
-
-    #[test]
-    fn session_write_leader_waits_for_pane_manifest() {
-        let state = State {
-            plugin_id: Some(11),
-            shared_state_ready: true,
-            ..Default::default()
-        };
-
-        assert!(!state.is_session_write_leader());
+        assert_eq!(state.write_role(), WriteRole::Unavailable);
     }
 
     #[test]
@@ -1976,6 +2556,142 @@ mod tests {
             state_after_close.pending_tab_claim_key_for_tab(&tab_after_close),
             "panes-19_20"
         );
+    }
+
+    #[test]
+    fn default_zellij_tab_gets_pending_claim_after_panes_are_known() {
+        let session_name = unique_session_name("default-tab-claim");
+        cleanup_session(&session_name);
+        let schema = test_schema("status");
+        let mut state = test_pipe_state(11, &session_name, &[11]);
+        state.schema = Some(schema.clone());
+        state.width_indexes = vec![WidthIndex::default(); schema.len()];
+        state.tabs = vec![TabInfo {
+            position: 16,
+            name: "Tab #18".to_string(),
+            ..Default::default()
+        }];
+
+        assert!(!state.reconcile_rows_with_tabs());
+        assert!(state.pending_tab_id_by_position.is_empty());
+
+        state.pane_manifest = PaneManifest {
+            panes: HashMap::from([(16, vec![test_terminal_pane(33), test_terminal_pane(34)])]),
+            ..Default::default()
+        };
+
+        assert!(state.reconcile_rows_with_tabs());
+        let tab_id = state.pending_tab_id_by_position.get(&16).unwrap();
+        assert!(state.rows_by_tab_id.is_empty());
+        assert_eq!(
+            state.pending_tab_claim_key_for_tab(&state.tabs[0]),
+            "panes-33_34"
+        );
+        assert_eq!(
+            SharedStateStore::new(sanitize_session_key(&session_name), 11)
+                .read_pending_tab_claim(&state.pending_tab_claim_key_for_tab(&state.tabs[0]))
+                .unwrap()
+                .tab_id,
+            *tab_id
+        );
+
+        cleanup_session(&session_name);
+    }
+
+    #[test]
+    fn pipe_update_waits_for_pane_manifest() {
+        let session_name = unique_session_name("deferred-pipe");
+        cleanup_session(&session_name);
+        let schema = test_schema("status");
+        let mut state = test_pipe_state(11, &session_name, &[11]);
+        state.schema = Some(schema.clone());
+        state.width_indexes = vec![WidthIndex::default(); schema.len()];
+        state.tabs = vec![TabInfo {
+            position: 0,
+            name: "Tab #1".to_string(),
+            ..Default::default()
+        }];
+
+        let payload = UpdatePayload {
+            version: 1,
+            pane_id: 33,
+            updates: BTreeMap::from([("status".to_string(), "READY".to_string())]),
+        };
+
+        assert!(!state.handle_update_payload(payload));
+        assert_eq!(state.pending_pipe_updates.len(), 1);
+
+        state.pane_manifest = PaneManifest {
+            panes: HashMap::from([(0, vec![test_terminal_pane(33)])]),
+            ..Default::default()
+        };
+        state.rebuild_pane_lookup();
+
+        assert!(state.replay_pending_pipe_updates());
+        assert!(state.pending_pipe_updates.is_empty());
+        let tab_id = state.pending_tab_id_by_position.get(&0).unwrap();
+        let row = state.rows_by_tab_id.get(tab_id).unwrap();
+        assert_eq!(row.cells[0].as_ref().unwrap().raw_input, "READY");
+
+        cleanup_session(&session_name);
+    }
+
+    #[test]
+    fn metadata_pipe_update_preserves_persisted_styled_status() {
+        let session_name = unique_session_name("styled-status-preserve");
+        cleanup_session(&session_name);
+        let schema = test_schema("status,directory,branch");
+        let mut state = test_pipe_state(11, &session_name, &[11]);
+        state.schema = Some(schema.clone());
+        state.width_indexes = vec![WidthIndex::default(); schema.len()];
+        state.tabs = vec![TabInfo {
+            position: 0,
+            name: "Tab #1".to_string(),
+            ..Default::default()
+        }];
+        state.pane_manifest = PaneManifest {
+            panes: HashMap::from([(0, vec![test_plugin_pane(11), test_terminal_pane(33)])]),
+            ..Default::default()
+        };
+        state.rebuild_pane_lookup();
+
+        let styled_status = "#[fg=#ebdbb2,bg=#504945,bold]IDLE".to_string();
+        assert!(state.handle_update_payload(UpdatePayload {
+            version: 1,
+            pane_id: 33,
+            updates: BTreeMap::from([("status".to_string(), styled_status.clone())]),
+        }));
+
+        let tab_id = state.pending_tab_id_by_position.get(&0).unwrap().clone();
+        let mirrored_name = state
+            .rows_by_tab_id
+            .get(&tab_id)
+            .unwrap()
+            .last_mirrored_tab_name
+            .clone()
+            .unwrap();
+        state.tabs[0].name = mirrored_name;
+
+        assert!(state.handle_update_payload(UpdatePayload {
+            version: 1,
+            pane_id: 33,
+            updates: BTreeMap::from([
+                ("directory".to_string(), "infrastructure".to_string()),
+                ("branch".to_string(), "main".to_string()),
+            ]),
+        }));
+
+        let row = state.rows_by_tab_id.get(&tab_id).unwrap();
+        assert_eq!(row.cells[0].as_ref().unwrap().raw_input, styled_status);
+
+        let persisted = SharedStateStore::new(sanitize_session_key(&session_name), 11)
+            .read_persisted_tab_state(&tab_id)
+            .unwrap();
+        assert_eq!(persisted.cells.get("status").unwrap(), &styled_status);
+        assert_eq!(persisted.cells.get("directory").unwrap(), "infrastructure");
+        assert_eq!(persisted.cells.get("branch").unwrap(), "main");
+
+        cleanup_session(&session_name);
     }
 
     #[test]
